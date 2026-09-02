@@ -88,6 +88,23 @@ func TestMMDCValidateAndRender(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Render() error = %v", err)
 			}
+			entries, err := os.ReadDir(renderTemp)
+			if err != nil {
+				t.Fatalf("read render temp before close: %v", err)
+			}
+			if len(entries) != 1 {
+				t.Fatalf("render temp entries = %v, want one active output directory", entries)
+			}
+			activeFiles, err := os.ReadDir(filepath.Join(renderTemp, entries[0].Name()))
+			if err != nil {
+				t.Fatalf("read active output directory: %v", err)
+			}
+			for _, file := range activeFiles {
+				if file.Name() == "diagram.mmd" {
+					t.Fatal("source file remains after rendering")
+				}
+			}
+
 			data, err := io.ReadAll(result)
 			if err != nil {
 				t.Fatalf("read result: %v", err)
@@ -105,7 +122,7 @@ func TestMMDCValidateAndRender(t *testing.T) {
 				t.Fatalf("Render() size = %d, want %d", result.Size, len(data))
 			}
 
-			entries, err := os.ReadDir(renderTemp)
+			entries, err = os.ReadDir(renderTemp)
 			if err != nil {
 				t.Fatalf("read render temp: %v", err)
 			}

@@ -275,6 +275,9 @@ func (m *MMDC) Render(ctx context.Context, request Request) (result Result, resu
 		}
 		return Result{}, &Error{Code: CodeRenderRejected, Message: message, Cause: err}
 	}
+	if err := os.Remove(inputPath); err != nil {
+		return Result{}, &Error{Code: CodeInternal, Message: "could not remove Mermaid source", Cause: err}
+	}
 
 	info, err := os.Stat(outputPath)
 	if err != nil {

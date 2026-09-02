@@ -144,6 +144,7 @@ Each render starts a new `mmdc` and Chromium process. This matches the isolated,
 The service applies these controls:
 
 - It writes each request to a private temporary directory.
+- It deletes the Mermaid source as soon as `mmdc` exits.
 - It streams the completed output file to HTTP clients, then removes the directory.
 - It reads output into memory only when MCP requires base64 image content.
 - It starts `mmdc` without a shell, so source cannot become a shell argument.
