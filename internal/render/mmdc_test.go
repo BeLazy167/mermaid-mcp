@@ -3,6 +3,7 @@ package render
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -87,11 +88,21 @@ func TestMMDCValidateAndRender(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Render() error = %v", err)
 			}
-			if string(result.Data) != tt.wantData {
-				t.Fatalf("Render() data = %q, want %q", result.Data, tt.wantData)
+			data, err := io.ReadAll(result)
+			if err != nil {
+				t.Fatalf("read result: %v", err)
+			}
+			if err := result.Close(); err != nil {
+				t.Fatalf("close result: %v", err)
+			}
+			if string(data) != tt.wantData {
+				t.Fatalf("Render() data = %q, want %q", data, tt.wantData)
 			}
 			if result.MIMEType != tt.wantMIME {
 				t.Fatalf("Render() MIME = %q, want %q", result.MIMEType, tt.wantMIME)
+			}
+			if result.Size != int64(len(data)) {
+				t.Fatalf("Render() size = %d, want %d", result.Size, len(data))
 			}
 
 			entries, err := os.ReadDir(renderTemp)

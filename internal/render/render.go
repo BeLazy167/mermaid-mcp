@@ -6,10 +6,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -82,10 +84,12 @@ type Request struct {
 	Format  Format
 }
 
-// Result contains a rendered image and its media type.
+// Result streams a rendered image. The caller must close it to remove its
+// temporary files.
 type Result struct {
-	Data     []byte
+	io.ReadCloser
 	MIMEType string
+	Size     int64
 }
 
 // Renderer renders Mermaid diagrams.
@@ -221,7 +225,11 @@ func (m *MMDC) Render(ctx context.Context, request Request) (result Result, resu
 	if err != nil {
 		return Result{}, &Error{Code: CodeInternal, Message: "could not prepare rendering", Cause: err}
 	}
+	cleanupOnReturn := true
 	defer func() {
+		if !cleanupOnReturn {
+			return
+		}
 		if err := os.RemoveAll(dir); err != nil {
 			cleanupErr := &Error{Code: CodeInternal, Message: "could not remove temporary files", Cause: err}
 			result = Result{}
@@ -281,15 +289,31 @@ func (m *MMDC) Render(ctx context.Context, request Request) (result Result, resu
 			Message: fmt.Sprintf("rendered image exceeds the %d-byte limit", m.maxOutputBytes),
 		}
 	}
-	data, err := os.ReadFile(outputPath)
+	file, err := os.Open(outputPath)
 	if err != nil {
-		return Result{}, &Error{Code: CodeInternal, Message: "could not read rendered image", Cause: err}
+		return Result{}, &Error{Code: CodeInternal, Message: "could not open rendered image", Cause: err}
 	}
-	if !validImage(request.Format, data) {
+	header := make([]byte, min(info.Size(), 512))
+	n, readErr := file.Read(header)
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		_ = file.Close()
+		return Result{}, &Error{Code: CodeInternal, Message: "could not read rendered image", Cause: readErr}
+	}
+	if !validImage(request.Format, header[:n]) {
+		_ = file.Close()
 		return Result{}, &Error{Code: CodeInternal, Message: "renderer produced an invalid image"}
 	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		_ = file.Close()
+		return Result{}, &Error{Code: CodeInternal, Message: "could not read rendered image", Cause: err}
+	}
 
-	return Result{Data: data, MIMEType: request.Format.MIMEType()}, nil
+	cleanupOnReturn = false
+	return Result{
+		ReadCloser: &cleanupReadCloser{file: file, tempDir: dir},
+		MIMEType:   request.Format.MIMEType(),
+		Size:       info.Size(),
+	}, nil
 }
 
 // MIMEType returns the media type for a format.
@@ -346,6 +370,24 @@ func sanitizeRendererMessage(message, tempDir string) string {
 		length += len(trimmed)
 	}
 	return strings.Join(publicLines, "\n")
+}
+
+type cleanupReadCloser struct {
+	file    *os.File
+	tempDir string
+	once    sync.Once
+	err     error
+}
+
+func (r *cleanupReadCloser) Read(data []byte) (int, error) {
+	return r.file.Read(data)
+}
+
+func (r *cleanupReadCloser) Close() error {
+	r.once.Do(func() {
+		r.err = errors.Join(r.file.Close(), os.RemoveAll(r.tempDir))
+	})
+	return r.err
 }
 
 type cappedWriter struct {

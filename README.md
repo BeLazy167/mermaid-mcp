@@ -127,15 +127,15 @@ gcloud run deploy mermaid-mcp \
   --region us-central1 \
   --memory 1Gi \
   --cpu 1 \
-  --concurrency 8 \
+  --concurrency 2 \
   --min 0 \
   --max 20 \
-  --set-env-vars RENDER_CONCURRENCY=2,MAX_IN_FLIGHT=8
+  --set-env-vars RENDER_CONCURRENCY=2,MAX_IN_FLIGHT=2
 ```
 
 Use `--min 1` to avoid cold starts. Use `--min 0` to reduce idle cost.
 
-100,000 requests per day averages about 1.16 requests per second. Actual capacity depends on diagram complexity and Chromium startup time. Load-test representative diagrams before setting production instance limits.
+100,000 requests per day averages about 1.16 requests per second. Actual capacity depends on diagram complexity and Chromium startup time. Load-test representative diagrams before setting production instance limits. Match platform concurrency to `RENDER_CONCURRENCY` so the load balancer scales before requests queue inside one instance.
 
 Each render starts a new `mmdc` and Chromium process. This matches the isolated, temporary-file design, but browser startup sets a latency floor. If measurements require lower latency, replace the renderer with a bounded persistent browser pool. Keep a fresh browser context per request.
 
@@ -144,7 +144,8 @@ Each render starts a new `mmdc` and Chromium process. This matches the isolated,
 The service applies these controls:
 
 - It writes each request to a private temporary directory.
-- It removes the directory before returning a response.
+- It streams the completed output file to HTTP clients, then removes the directory.
+- It reads output into memory only when MCP requires base64 image content.
 - It starts `mmdc` without a shell, so source cannot become a shell argument.
 - It limits input size, output size, render time, render concurrency, and in-flight requests.
 - It kills the renderer process group when a request times out on Linux and macOS.
@@ -170,7 +171,7 @@ Stateless Go HTTP service
 Bounded mmdc subprocess pool
         |
         v
-Private temporary files -> response bytes -> immediate deletion
+Private temporary files -> streamed response -> immediate deletion
 ```
 
 Each instance is independent. The service uses no database, object store, cache, or session state.

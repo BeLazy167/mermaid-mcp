@@ -11,6 +11,7 @@ import (
 	"math"
 	"mime"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/belazy/mermaid-mcp/internal/render"
@@ -40,12 +41,15 @@ type apiError struct {
 }
 
 // New returns the complete HTTP handler for health, REST, and MCP routes.
-func New(renderer render.Renderer, options Options) http.Handler {
+func New(renderer render.Renderer, options Options) (http.Handler, error) {
+	if renderer == nil {
+		return nil, errors.New("renderer is required")
+	}
 	if options.MaxDiagramBytes <= 0 {
-		options.MaxDiagramBytes = 50_000
+		return nil, errors.New("MaxDiagramBytes must be positive")
 	}
 	if options.MaxInFlight <= 0 {
-		options.MaxInFlight = 16
+		return nil, errors.New("MaxInFlight must be positive")
 	}
 	if options.Logger == nil {
 		options.Logger = slog.Default()
@@ -75,7 +79,7 @@ func New(renderer render.Renderer, options Options) http.Handler {
 	mux.HandleFunc("/healthz", handleHealth)
 
 	originProtection := http.NewCrossOriginProtection()
-	return securityHeaders(originProtection.Handler(mux))
+	return securityHeaders(originProtection.Handler(mux)), nil
 }
 
 func newMCPServer(renderer render.Renderer, options Options) *mcp.Server {
@@ -103,9 +107,20 @@ func newMCPServer(renderer render.Renderer, options Options) *mcp.Server {
 			logRenderError(options.Logger, err)
 			return toolError(err), nil, nil
 		}
+		data, readErr := io.ReadAll(result)
+		closeErr := result.Close()
+		if readErr != nil || closeErr != nil {
+			err := &render.Error{
+				Code:    render.CodeInternal,
+				Message: "could not read rendered image",
+				Cause:   errors.Join(readErr, closeErr),
+			}
+			logRenderError(options.Logger, err)
+			return toolError(err), nil, nil
+		}
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{
-				&mcp.ImageContent{Data: result.Data, MIMEType: result.MIMEType},
+				&mcp.ImageContent{Data: data, MIMEType: result.MIMEType},
 			},
 		}, nil, nil
 	})
@@ -138,9 +153,14 @@ func handleRender(
 
 	writer.Header().Set("Cache-Control", "no-store")
 	writer.Header().Set("Content-Type", result.MIMEType)
+	writer.Header().Set("Content-Length", strconv.FormatInt(result.Size, 10))
 	writer.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=\"diagram.%s\"", input.Format))
 	writer.WriteHeader(http.StatusOK)
-	_, _ = writer.Write(result.Data)
+	_, copyErr := io.Copy(writer, result)
+	closeErr := result.Close()
+	if copyErr != nil || closeErr != nil {
+		options.Logger.Error("stream rendered image", "error", errors.Join(copyErr, closeErr))
+	}
 }
 
 func parseRenderInput(writer http.ResponseWriter, request *http.Request, maxDiagramBytes int64) (render.Request, error) {

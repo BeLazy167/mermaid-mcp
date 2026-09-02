@@ -43,12 +43,15 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
-	handler := server.New(renderer, server.Options{
+	handler, err := server.New(renderer, server.Options{
 		Version:         version,
 		MaxDiagramBytes: cfg.MaxDiagramBytes,
 		MaxInFlight:     cfg.MaxInFlight,
 		Logger:          logger,
 	})
+	if err != nil {
+		return err
+	}
 	httpServer := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           handler,

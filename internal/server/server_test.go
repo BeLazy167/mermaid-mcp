@@ -98,7 +98,7 @@ func TestRenderEndpoint(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fake := &fakeRenderer{err: tt.renderErr}
-			handler := New(fake, testOptions())
+			handler := mustNew(t, fake, testOptions())
 			req := httptest.NewRequest(http.MethodPost, "/render"+tt.query, strings.NewReader(tt.body))
 			if tt.contentType != "" {
 				req.Header.Set("Content-Type", tt.contentType)
@@ -125,12 +125,38 @@ func TestRenderEndpoint(t *testing.T) {
 			if tt.wantFormat != "" && fake.lastRequest().Format != tt.wantFormat {
 				t.Fatalf("renderer format = %q, want %q", fake.lastRequest().Format, tt.wantFormat)
 			}
+			if tt.wantMIME != "" && fake.closeCount() != 1 {
+				t.Fatalf("result close count = %d, want 1", fake.closeCount())
+			}
 		})
 	}
 }
 
-func TestMethodsAndDefaultOptions(t *testing.T) {
-	handler := New(&fakeRenderer{}, Options{})
+func TestNewRejectsInvalidOptions(t *testing.T) {
+	tests := []struct {
+		name     string
+		renderer render.Renderer
+		options  Options
+	}{
+		{name: "missing renderer", renderer: nil, options: testOptions()},
+		{name: "invalid diagram limit", renderer: &fakeRenderer{}, options: Options{MaxInFlight: 1}},
+		{name: "invalid in-flight limit", renderer: &fakeRenderer{}, options: Options{MaxDiagramBytes: 1}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := New(tt.renderer, tt.options); err == nil {
+				t.Fatal("New() error = nil")
+			}
+		})
+	}
+}
+
+func TestMethods(t *testing.T) {
+	options := testOptions()
+	options.Logger = nil
+	options.Version = ""
+	handler := mustNew(t, &fakeRenderer{}, options)
 	tests := []struct {
 		name       string
 		method     string
@@ -154,7 +180,7 @@ func TestMethodsAndDefaultOptions(t *testing.T) {
 }
 
 func TestRenderEndpointRejectsUnsupportedFormat(t *testing.T) {
-	handler := New(&fakeRenderer{}, testOptions())
+	handler := mustNew(t, &fakeRenderer{}, testOptions())
 	request := httptest.NewRequest(http.MethodPost, "/render?format=pdf", strings.NewReader("graph TD; A-->B"))
 	request.Header.Set("Content-Type", "text/plain")
 	response := httptest.NewRecorder()
@@ -169,7 +195,7 @@ func TestRenderEndpointRejectsUnsupportedFormat(t *testing.T) {
 func TestRenderEndpointRejectsOversizedBody(t *testing.T) {
 	options := testOptions()
 	options.MaxDiagramBytes = 4
-	handler := New(&fakeRenderer{}, options)
+	handler := mustNew(t, &fakeRenderer{}, options)
 	request := httptest.NewRequest(http.MethodPost, "/render", strings.NewReader("12345"))
 	request.Header.Set("Content-Type", "text/plain")
 	response := httptest.NewRecorder()
@@ -187,7 +213,7 @@ func TestRenderEndpointBoundsInFlightRequests(t *testing.T) {
 	fake := &fakeRenderer{started: started, release: release}
 	options := testOptions()
 	options.MaxInFlight = 1
-	handler := New(fake, options)
+	handler := mustNew(t, fake, options)
 
 	firstDone := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
@@ -228,7 +254,7 @@ func TestRenderEndpointBoundsInFlightRequests(t *testing.T) {
 
 func TestMCPRenderTool(t *testing.T) {
 	fake := &fakeRenderer{}
-	httpServer := httptest.NewServer(New(fake, testOptions()))
+	httpServer := httptest.NewServer(mustNew(t, fake, testOptions()))
 	defer httpServer.Close()
 
 	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "1.0.0"}, nil)
@@ -275,6 +301,9 @@ func TestMCPRenderTool(t *testing.T) {
 	if image.MIMEType != "image/svg+xml" || !bytes.Equal(image.Data, []byte("svg-data")) {
 		t.Fatalf("image = %#v", image)
 	}
+	if fake.closeCount() != 1 {
+		t.Fatalf("result close count = %d, want 1", fake.closeCount())
+	}
 
 	invalid, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 		Name: "render_mermaid",
@@ -296,7 +325,7 @@ func TestMCPRenderTool(t *testing.T) {
 }
 
 func TestCrossOriginRenderRequestIsRejected(t *testing.T) {
-	handler := New(&fakeRenderer{}, testOptions())
+	handler := mustNew(t, &fakeRenderer{}, testOptions())
 	request := httptest.NewRequest(http.MethodPost, "/render", strings.NewReader("graph TD; A-->B"))
 	request.Header.Set("Content-Type", "text/plain")
 	request.Header.Set("Origin", "https://attacker.example")
@@ -311,7 +340,7 @@ func TestCrossOriginRenderRequestIsRejected(t *testing.T) {
 }
 
 func TestHealthEndpoint(t *testing.T) {
-	handler := New(&fakeRenderer{}, testOptions())
+	handler := mustNew(t, &fakeRenderer{}, testOptions())
 	request := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	response := httptest.NewRecorder()
 
@@ -333,6 +362,7 @@ type fakeRenderer struct {
 	mu      sync.Mutex
 	request render.Request
 	err     error
+	closed  int
 	started chan struct{}
 	release chan struct{}
 }
@@ -355,15 +385,55 @@ func (f *fakeRenderer) Render(ctx context.Context, request render.Request) (rend
 		return render.Result{}, f.err
 	}
 	if request.Format == render.FormatSVG {
-		return render.Result{Data: []byte("svg-data"), MIMEType: "image/svg+xml"}, nil
+		return f.result("svg-data", "image/svg+xml"), nil
 	}
-	return render.Result{Data: []byte("png-data"), MIMEType: "image/png"}, nil
+	return f.result("png-data", "image/png"), nil
+}
+
+func (f *fakeRenderer) result(data, mimeType string) render.Result {
+	return render.Result{
+		ReadCloser: &trackingReadCloser{
+			Reader: strings.NewReader(data),
+			close: func() {
+				f.mu.Lock()
+				defer f.mu.Unlock()
+				f.closed++
+			},
+		},
+		MIMEType: mimeType,
+		Size:     int64(len(data)),
+	}
 }
 
 func (f *fakeRenderer) lastRequest() render.Request {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.request
+}
+
+func (f *fakeRenderer) closeCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closed
+}
+
+type trackingReadCloser struct {
+	io.Reader
+	close func()
+}
+
+func (r *trackingReadCloser) Close() error {
+	r.close()
+	return nil
+}
+
+func mustNew(t *testing.T, renderer render.Renderer, options Options) http.Handler {
+	t.Helper()
+	handler, err := New(renderer, options)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	return handler
 }
 
 func testOptions() Options {
