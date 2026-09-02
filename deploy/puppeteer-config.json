@@ -1,0 +1,8 @@
+{
+  "executablePath": "/usr/bin/chromium-browser",
+  "args": [
+    "--disable-dev-shm-usage",
+    "--proxy-server=http://0.0.0.0:9",
+    "--proxy-bypass-list=<-loopback>"
+  ]
+}
