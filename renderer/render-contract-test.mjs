@@ -5,6 +5,7 @@ const browser = await puppeteer.launch({
   executablePath: process.env.CHROMIUM_PATH ?? "/usr/bin/chromium",
   headless: true,
   pipe: true,
+  dumpio: process.env.MERMAID_TEST_DUMPIO === "true",
   args: ["--disable-background-networking", "--proxy-server=http://0.0.0.0:9", "--host-resolver-rules=MAP * 0.0.0.0"],
 });
 try {

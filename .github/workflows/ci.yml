@@ -41,8 +41,8 @@ jobs:
       - name: Verify pinned runtime and dependency patches
         run: |
           docker run --rm --entrypoint node mermaid-mcp:test /app/containment-test.mjs
-          docker run --rm --user node --entrypoint node mermaid-mcp:test /app/context-isolation-test.mjs
-          docker run --rm --user node --entrypoint node mermaid-mcp:test /app/render-contract-test.mjs
+          docker run --rm --user node --entrypoint node -e MERMAID_TEST_DUMPIO=true mermaid-mcp:test /app/context-isolation-test.mjs
+          docker run --rm --user node --entrypoint node -e MERMAID_TEST_DUMPIO=true mermaid-mcp:test /app/render-contract-test.mjs
           docker run --rm --user node --entrypoint renderer-launcher mermaid-mcp:test /usr/local/bin/node /app/network-isolation-test.mjs
           test "$(docker run --rm --entrypoint node mermaid-mcp:test --version)" = "v22.22.3"
           test "$(docker run --rm --entrypoint node mermaid-mcp:test -p 'require("/app/node_modules/puppeteer/package.json").version')" = "25.9.0"
