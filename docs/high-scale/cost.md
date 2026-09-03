@@ -14,7 +14,7 @@ With a 99.9% local cache-hit ratio, the modeled monthly totals are:
 - **$5,562** for 100 KiB inline responses.
 - **$313 to $2,176** for URL delivery. The range depends on R2 and CDN cache locality.
 
-These totals use the current two-Machine minimum. They include the admission service. They exclude optional products and tax.
+These totals use the current two-Machine minimum. They include the admission service. They exclude optional products and tax. Serving one fill/second requires `MISS_PER_DAY` of at least 86,400. The default 50,000 limit rejects fills above its daily budget.
 
 At zero cache locality, the service is not low cost. The measured capacity model needs 244 `performance-4x` Machines with N+1 headroom. Compute alone is about **$30,256/month** on demand. R2 URL writes add about **$11,660/month** if every request creates an object.
 
@@ -179,7 +179,7 @@ Use this budget before real traffic data exists:
 6. Add an edge limit for total requests and bytes. The miss budget does not limit cache-hit egress.
 7. Buy reservations only after 30 days of stable capacity and locality data.
 
-For a sustained 1,000-RPS launch, budget **$1,500/month** for representative 20 KiB inline traffic. Budget **$6,000/month** if responses may average 100 KiB. These budgets assume at least 99.9% local cache hits. They do not fund 1,000 unique renders/second.
+For a sustained 1,000-RPS launch, budget **$1,500/month** for representative 20 KiB inline traffic. Budget **$6,000/month** if responses may average 100 KiB. The default daily fill limit requires at least a 99.95% local hit ratio to serve all requests. These budgets do not fund 1,000 unique renders/second.
 
 ## Cost formulas
 
