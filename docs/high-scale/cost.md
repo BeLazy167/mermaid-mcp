@@ -1,363 +1,228 @@
-# Infrastructure cost at 1,000 requests/second
+# Cost estimate for the implemented service
 
-Checked **2026-09-03 UTC**. Prices are public USD list prices. They exclude tax, support, logs, WAF or bot products, and negotiated discounts.
+Checked **2026-09-03 UTC**. All prices are public USD list prices. The estimate excludes tax, support, logs, WAF products, domain fees, and negotiated discounts.
 
-## Decision
+## Bottom line
 
-Use a browser-free render path where possible:
+The current Fly configuration starts at **$248/month** for two `performance-4x` Machines. The shared Cloudflare admission service adds about **$5.08/month** at its default 50,000-fill daily limit.
 
-1. Keep Mermaid and its DOM support warm in bounded workers.
-2. Produce SVG first.
-3. Produce PNG from the SVG with a native or WebAssembly rasterizer.
-4. Keep pooled Chromium only as a compatibility fallback.
-5. Never start `mmdc` and Chromium for each request at this scale.
+Traffic cost depends on response size. At a sustained 1,000 requests/second, each average **1 KiB per response costs $53.08/month** in Fly egress. A 20 KiB inline response costs about **$1,062/month**. A 100 KiB inline response costs about **$5,308/month**.
 
-The cheapest credible **uncached** deployment in this comparison is **Fly Machines with performance CPUs**. The modeled monthly floor is about **$3,790 for SVG** or **$10,516 for PNG**. A 40% Fly compute reservation lowers those totals to about **$2,698** and **$8,433** after the workload is stable.
+With a 99.9% local cache-hit ratio, the modeled monthly totals are:
 
-Cloudflare Workers are numerically cheaper. They cost about **$3,371 for the SVG case** and **$5,963 for the PNG case**. However, this is credible only after a browser-free Mermaid implementation proves it fits the 128 MB isolate and 10 MB compressed bundle limits. The current `mmdc` plus Chromium implementation cannot run there unchanged.
+- **$1,315** for 20 KiB inline responses.
+- **$5,562** for 100 KiB inline responses.
+- **$313 to $2,176** for URL delivery. The range depends on R2 and CDN cache locality.
 
-Do not add object storage by default. Start with content hashes and a bounded local cache. Cloudflare deployments should use Workers Cache before R2. Add R2 or Tigris only after measured reuse clears the thresholds in [Caching break-even](#caching-break-even).
+These totals use the current two-Machine minimum. They include the admission service. They exclude optional products and tax.
 
-## Workload and assumptions
+At zero cache locality, the service is not low cost. The measured capacity model needs 244 `performance-4x` Machines with N+1 headroom. Compute alone is about **$30,256/month** on demand. R2 URL writes add about **$11,660/month** if every request creates an object.
 
-A sustained 1,000 requests/second is not a burst:
+## Workload
 
-```text
-seconds/month = 30 × 24 × 60 × 60 = 2,592,000
-requests/month = 1,000 × 2,592,000 = 2,592,000,000
-```
-
-The model uses these planning values. They are not Mermaid benchmarks.
-
-| Input | SVG case | PNG case |
-|---|---:|---:|
-| Mean CPU time per request | 50 ms | 100 ms |
-| Target CPU utilization | 60% | 60% |
-| Required provisioned CPU | 84 vCPU | 168 vCPU |
-| Worker shape | 4 vCPU | 4 vCPU |
-| Worker count | 21 | 42 |
-| Render artifact before MCP encoding | 15 KiB | 75 KiB |
-| Mean MCP response on wire | 20 KiB | 100 KiB |
-| Mean request body and headers | 4 KiB | 4 KiB |
-
-The 20 KiB and 100 KiB response values include the approximate 4:3 base64 expansion used by MCP image content. A raw `/render` response is about 25% smaller under these assumptions.
-
-All egress examples use North American users and one US deployment. Global traffic costs more on providers with regional egress rates. High availability can split the same total worker count across zones or regions. Extra regional spare capacity is not included.
-
-### Sizing formulas
-
-Let:
-
-- `R` be requests/second.
-- `c` be vCPU-seconds/request.
-- `u` be target CPU utilization.
-- `q` be vCPU/worker.
-- `s` be response bytes/request.
-
-Then:
+A sustained 1,000 requests/second produces 2.592 billion requests in a 30-day month:
 
 ```text
-required vCPU = R × c / u
-workers = ceil(required vCPU / q)
-monthly bytes = R × seconds/month × s
+seconds/month = 30 * 24 * 60 * 60 = 2,592,000
+requests/month = 1,000 * 2,592,000 = 2,592,000,000
 ```
 
-Every additional **50 ms of CPU/request** adds 50 continuously busy vCPUs, or about **84 provisioned vCPUs at a 60% target**. Replace the planning values with production measurements before buying capacity.
-
-## Sustained monthly comparison
-
-The table uses on-demand prices and the assumptions above. `Requests / LB` includes request operations, Durable Object routing, or load-balancer capacity. Direct-render storage is zero.
-
-| Deployment | Compute: SVG | Requests / LB: SVG | Storage | Egress: SVG | **SVG total** | Compute: PNG | Requests / LB: PNG | Storage | Egress: PNG | **PNG total** |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Cloudflare Workers, browser-free | $2,591 | $780 | $0 | $0 | **$3,371** | $5,183 | $780 | $0 | $0 | **$5,963** |
-| Fly performance Machines, IAD | $2,728 | $0 | $0 | $1,062 | **$3,790** | $5,208 | $0 | $0 | $5,308 | **$10,516** |
-| Cloudflare Browser Run, 200 warm browsers | — | — | — | — | — | $13,339 | $780 | $0 | $0 | **$14,119\*** |
-| Cloudflare Containers | $4,301 | $1,256 | $0 | $1,302 | **$6,859** | $8,602 | $1,343 | $0 | $6,611 | **$16,556** |
-| AWS ECS on ARM Fargate + ALB | $2,389 | $526 | $0 | $4,245 | **$7,160** | $4,778 | $2,225 | $0 | $16,246 | **$23,248** |
-| Google Cloud Run, instance billing | $4,790 | $0 | $0 | $4,272 | **$9,062** | $9,580 | $0 | $0 | $20,093 | **$29,673** |
-
-Small included allowances are ignored except where they materially change the formula. Numbers are rounded to the nearest dollar. \*Browser Run is a best-case cost at its default 200-browser limit. It has no headroom and is not a viable default 1,000-RPS design.
-
-### Output volume
+The cost model separates total requests from unique render fills:
 
 ```text
-SVG: 2.592B × 20 KiB = 53,084 GB = 49,438 GiB/month
-PNG: 2.592B × 100 KiB = 265,421 GB = 247,192 GiB/month
+fill_rps = total_rps * (1 - local_cache_hit_ratio)
 ```
 
-Egress dominates the AWS and Cloud Run result. It also exceeds Fly compute in the PNG case. Compression and response-size limits therefore matter as much as CPU tuning.
+Cache hits and same-key joins do not consume render admission. Unique fills consume browser capacity and the cluster admission budget.
 
-### Current process-per-request sensitivity
+## Measured capacity
 
-The existing process model has this concurrency requirement:
+The committed `f1eec2faf97d` image was tested on Docker Desktop with four CPUs, 8 GiB, four workers, and concurrency four. Each run used 100 unique small flowcharts. Local and client miss limits were raised for the benchmark.
+
+| Format | Throughput | p50 | p95 | Peak observed CPU |
+| --- | ---: | ---: | ---: | ---: |
+| SVG | 6.90 fills/s | 573 ms | 707 ms | 407% |
+| PNG | 6.86 fills/s | 565 ms | 786 ms | 407% |
+
+The model uses the lower result and a 60% target:
 
 ```text
-simultaneous mmdc processes = requests/second × mean wall seconds/request
+planned fill capacity per performance-4x = 6.86 * 0.60 = 4.12 fills/s
+active Machines = ceil(fill_rps / 4.12)
+provisioned Machines = max(2, active Machines + 1)
 ```
 
-A 1.0-second mean render needs 1,000 simultaneous `mmdc` processes. A 1.5-second mean needs 1,500. This is unsafe and expensive before accounting for hostile worst-case diagrams.
+The extra Machine provides N+1 capacity. Two Machines remain the minimum for availability.
 
-CPU cost also scales linearly. A measured 1.0 vCPU-second/request needs about 1,667 provisioned vCPUs at the 60% target. That is ten times the compute in the modeled PNG case. It also exceeds Cloudflare Containers' published 1,500-vCPU account limit.
+Docker Desktop is not Fly hardware. Treat the machine counts as planning numbers until the production image passes the same test on Fly. If Fly capacity is half the measured proxy, compute roughly doubles.
 
-## Provider details
+## Fly compute
 
-### Cloud Run
+The deployed shape in `fly.toml` is `performance-4x` with 8 GB in IAD. Its current list price is **$124/month**. Fly reservation blocks discount eligible compute by 40% when paid annually. The reservation column assumes full use of the credits.
 
-Use a Cloud Run service with **instance-based billing** for sustained traffic. In `us-central1`, instance billing is $0.000018/vCPU-second and $0.000002/GiB-second. Request-based billing is $0.000024/vCPU-second, $0.0000025/GiB-second, and $0.40/million requests. At this volume, its request line alone is about:
+| Local hit ratio | New fills/s | Active Machines | Machines with N+1 | On demand | Reserved, amortized |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 99.9% | 1 | 1 | 2 | $248 | $149 |
+| 99% | 10 | 3 | 4 | $496 | $298 |
+| 95% | 50 | 13 | 14 | $1,736 | $1,042 |
+| 90% | 100 | 25 | 26 | $3,224 | $1,934 |
+| 50% | 500 | 122 | 123 | $15,252 | $9,151 |
+| 0% | 1,000 | 243 | 244 | $30,256 | $18,154 |
+
+The current two-Machine fleet has about 8.2 planned fills/second in normal operation. It has about 4.1 fills/second after one Machine fails. The `RENDER_MISS_RPS=10` value in `fly.toml` is therefore above the measured N+1 planning capacity.
+
+A lean launch can test two `performance-2x` Machines with two workers each. Those Machines cost **$62/month each** in IAD. This lowers the fixed compute floor from $248 to $124. Do not make this change before a Fly benchmark confirms capacity and RSS.
+
+## Fly egress
+
+North America and Europe public-internet egress costs $0.02/GB. At 1,000 sustained requests/second:
 
 ```text
-(2,592M - 2M free) × $0.40/M = $1,036/month
+egress/month = average_response_KiB * $53.08416
 ```
 
-Instance billing avoids that request charge and uses lower compute rates. The model uses 84 or 168 vCPU with 2 GiB/vCPU.
+| Average response | Monthly data | Monthly Fly egress |
+| ---: | ---: | ---: |
+| 1 KiB | 2.65 TB | $53 |
+| 20 KiB | 53.08 TB | $1,062 |
+| 100 KiB | 265.42 TB | $5,308 |
 
-Cloud Run's default revision maximum is 100 instances. The modeled 21 or 42 four-vCPU instances fit, but regional CPU and memory quotas vary and require approval. A service can configure up to 1,000 concurrent requests per instance, but renderer concurrency must equal the tested worker-pool capacity. Cloud Run targets 60% CPU and concurrency by default. Requests can wait for 10 seconds or 3.5 times predicted startup time, whichever is greater, before failing when capacity is unavailable.
+The representative nine-diagram test averaged 13.2 KiB raw SVG and 11.3 KiB raw PNG. MCP base64 expands bytes by about one third. The 20 KiB case represents these small diagrams after MCP framing. The 100 KiB case is a planning value for larger PNG output, not a measured mean.
 
-North America Premium Tier egress is 1 GiB free, then $0.12/GiB through 1 TiB, $0.11/GiB through 10 TiB, and $0.08/GiB above 10 TiB.
+Every extra 10 KiB at 1,000 requests/second adds about **$531/month**. Measure production response sizes before setting the budget.
 
-Sources:
+## Inline monthly totals
 
-- [Cloud Run pricing](https://cloud.google.com/run/pricing) — accessed 2026-09-03.
-- [Cloud Run quotas and limits](https://cloud.google.com/run/quotas) — updated 2026-09-01; accessed 2026-09-03.
-- [Cloud Run autoscaling](https://cloud.google.com/run/docs/about-instance-autoscaling) — updated 2026-09-01; accessed 2026-09-03.
-- [Google Cloud network pricing](https://cloud.google.com/vpc/network-pricing) — accessed 2026-09-03.
+The next table includes on-demand Fly compute, Fly egress, and shared admission. It uses a 20 KiB representative response and a 100 KiB large response.
 
-### Cloudflare Workers
+| Local hit ratio | New fills/s | Admission | Total at 20 KiB | Total at 100 KiB |
+| ---: | ---: | ---: | ---: | ---: |
+| 99.9% | 1 | $5 | **$1,315** | **$5,562** |
+| 99% | 10 | $14 | **$1,571** | **$5,818** |
+| 95% | 50 | $140 | **$2,937** | **$7,184** |
+| 90% | 100 | $328 | **$4,613** | **$8,860** |
+| 50% | 500 | $1,831 | **$18,145** | **$22,391** |
+| 0% | 1,000 | $3,710 | **$35,028** | **$39,275** |
 
-Workers Paid includes 10 million requests and 30 million CPU-ms each month. Overage is $0.30/million requests and $0.02/million CPU-ms. There is no Workers egress fee.
+The table assumes every request succeeds. The configured admission limits reject excess unique work with `429`, so operators must raise those limits to serve the lower hit-ratio rows.
 
-At 2.592 billion monthly requests:
+## Shared admission
+
+The optional admission Worker runs one global SQLite-backed Durable Object. One admitted fill invokes the Worker, invokes the Durable Object, and writes one counter row.
+
+Cloudflare includes these monthly allowances in the $5 Workers Paid plan:
+
+- 10 million Worker requests.
+- 1 million Durable Object requests.
+- 50 million SQLite rows written.
+- 400,000 GB-seconds of Durable Object duration.
+
+The model assumes that one continuously active 128 MB Durable Object stays within the duration allowance. It prices one row write for each admitted fill.
+
+| New fills/s | Fills/month | Estimated admission cost |
+| ---: | ---: | ---: |
+| Default daily limit | 1.50 million | $5.08 |
+| 1 | 2.59 million | $5.24 |
+| 10 | 25.92 million | $13.51 |
+| 50 | 129.60 million | $139.77 |
+| 100 | 259.20 million | $327.69 |
+| 500 | 1.296 billion | $1,831.05 |
+| 1,000 | 2.592 billion | $3,710.25 |
+
+The default `MISS_PER_DAY=50000` permits an average 0.579 fills/second. It caps render spend but does not cap cache-hit bandwidth.
+
+Worker CPU is not included because it has not been measured. At 1 ms of Worker CPU per admission, Cloudflare's CPU charge adds nothing below 10 fills/second and about $51/month at 1,000 fills/second. A single global Durable Object has not been load-tested at the higher rates in this table. Cost does not prove that it has enough capacity.
+
+## URL delivery through R2
+
+URL delivery returns a small MCP `ResourceLink`. It stores only validated output. The client then fetches the immutable asset from R2 through a custom domain.
+
+R2 Standard pricing is:
+
+- $0.015/GB-month after 10 GB-months.
+- $4.50 per million Class A writes after 1 million.
+- $0.36 per million Class B reads after 10 million.
+- No R2 egress charge.
+
+A new URL object normally causes at least one gateway HEAD, one PUT, and one client origin GET. The HEAD and GET are Class B operations. Local metadata and CDN hits remove most repeat operations when locality is high.
+
+At 1,000 total requests/second, one Class B operation per public request costs **$929.52/month**. Two cost **$1,862.64/month**.
+
+Each sustained unique fill per second creates 2.592 million monthly writes. After the shared free allowance, one fill/second costs about **$7.16/month** in writes. The marginal cost is $11.66 for each additional fill/second.
+
+The following URL totals include a 1 KiB Fly response, 15 KiB raw objects, on-demand compute, and admission. The lower bound counts two R2 Class B operations per unique object. The upper bound counts two Class B operations per public request.
+
+| Local hit ratio | New fills/s | URL lower bound | URL upper bound |
+| ---: | ---: | ---: | ---: |
+| 99.9% | 1 | **$313** | **$2,176** |
+| 99% | 10 | **$690** | **$2,537** |
+| 95% | 50 | **$2,598** | **$4,371** |
+| 90% | 100 | **$4,952** | **$6,631** |
+| 50% | 500 | **$23,903** | **$24,836** |
+| 0% | 1,000 | **$47,561** | **$47,561** |
+
+The one-day lifecycle keeps storage small. At 1,000 unique 15 KiB objects per second, storage is about $20/month. Using 75 KiB PNG objects raises it to about $99/month. Write operations dominate storage cost.
+
+The application does not delete expired R2 objects. Configure the bucket lifecycle separately. Without that rule, 1,000 unique fills/second adds about 39.8 TB of 15 KiB objects each month. A 75 KiB mean adds about 199 TB each month.
+
+URL delivery usually wins for larger PNG responses. For small SVG responses, it wins only when the R2 metadata memo and CDN absorb most repeat reads. Unique traffic makes URL delivery more expensive because every object adds a write.
+
+## Starting budget
+
+Use this budget before real traffic data exists:
+
+1. Keep two `performance-4x` Machines. Compute is capped near $248/month.
+2. Enable the 50,000-fill daily Durable Object limit. Admission is about $5.08/month.
+3. Keep inline delivery as the default.
+4. Enable URL delivery for large outputs or clients that accept links.
+5. Set alerts at $350, $750, and $1,500.
+6. Add an edge limit for total requests and bytes. The miss budget does not limit cache-hit egress.
+7. Buy reservations only after 30 days of stable capacity and locality data.
+
+For a sustained 1,000-RPS launch, budget **$1,500/month** for representative 20 KiB inline traffic. Budget **$6,000/month** if responses may average 100 KiB. These budgets assume at least 99.9% local cache hits. They do not fund 1,000 unique renders/second.
+
+## Cost formulas
+
+Use these formulas with production values:
 
 ```text
-request cost = $5 + (2,592M - 10M) × $0.30/M = $779.60
-CPU cost ≈ $51.84 × mean CPU-ms/request - $0.60
+monthly_requests = total_rps * 2,592,000
+fill_rps = total_rps * (1 - local_hit_ratio)
+planned_fill_capacity_per_machine = measured_fill_rps_per_machine * target_utilization
+machines = max(2, ceil(fill_rps / planned_fill_capacity_per_machine) + 1)
+compute = machines * machine_monthly_price
+egress = monthly_requests * average_response_bytes / 1,000,000,000 * region_egress_price
 ```
 
-Workers have no general RPS limit. The hard concerns are the 128 MB memory limit, bundle size, runtime compatibility, and abuse. Paid HTTP invocations default to 30 seconds CPU and can configure up to five minutes. Stock Mermaid CLI and Chromium need another product.
-
-Workers Cache is important. It checks tiered cache before Worker execution, collapses concurrent fills, and charges no extra cache operation or storage fee. Cache hits still pay the normal request price but no Worker CPU. It caches `GET` and `HEAD`. MCP `POST` calls need a small gateway that hashes the canonical request and issues an internal synthetic `GET` to a cacheable renderer entrypoint.
-
-Sources:
-
-- [Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/) — updated 2026-08-28; accessed 2026-09-03.
-- [Workers limits](https://developers.cloudflare.com/workers/platform/limits/) — updated 2026-07-28; accessed 2026-09-03.
-- [Workers Cache](https://developers.cloudflare.com/workers/cache/) — updated 2026-07-21; accessed 2026-09-03.
-- [Workers Cache limitations](https://developers.cloudflare.com/workers/cache/limitations/) — updated 2026-08-25; accessed 2026-09-03.
-
-### Cloudflare Containers
-
-Containers can run the current Linux/amd64 Chromium image after the renderer stops creating a new browser process for every request. Cloudflare charges:
-
-- $0.000020/active vCPU-second.
-- $0.0000025/provisioned GiB-second.
-- $0.00000007/provisioned GB-second of disk.
-- Worker requests at normal Workers rates.
-- Durable Object requests at $0.15/million after 1 million included.
-- Active Durable Object duration at $12.50/million GB-seconds after 400,000 GB-seconds included.
-- North America and Europe egress at $0.025/GB after 1 TB/month.
-
-The model uses 21 or 42 `standard-4` instances. Each has 4 vCPU, 12 GiB, and 20 GB disk. Container CPU is billed only when active. Memory and disk are provisioned charges. The egress estimate assumes bytes proxied from a Container through its Worker count as Container egress. Confirm that accounting with Cloudflare before setting a budget.
-
-The account limits are 1,500 concurrent vCPU, 6 TiB memory, and 30 TB disk. The optimized model fits. A 1.0-vCPU-second/request process model nearly consumes the entire CPU limit before safe headroom.
-
-Containers do not yet provide built-in stateless autoscaling. The application chooses a fixed pool of IDs and routes with `getRandom`, or runs its own controller. Images are prefetched globally, but cold starts and placement still make a sudden step load unsafe without a warm pool.
-
-Sources:
-
-- [Containers pricing](https://developers.cloudflare.com/containers/pricing/) — updated 2026-04-21; accessed 2026-09-03.
-- [Container limits](https://developers.cloudflare.com/containers/platform-details/limits/) — updated 2026-07-03; accessed 2026-09-03.
-- [Container scaling and routing](https://developers.cloudflare.com/containers/platform-details/scaling-and-routing/) — updated 2026-04-21; accessed 2026-09-03.
-- [Container architecture](https://developers.cloudflare.com/containers/platform-details/architecture/) — updated 2026-08-13; accessed 2026-09-03.
-- [Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/) — updated 2026-08-25; accessed 2026-09-03.
-
-### Cloudflare Browser Run
-
-Browser Run is not a default 1,000-RPS solution.
-
-Paid Quick Actions allow 30 requests/second. Browser Sessions allow 200 concurrent browsers and three new browser instances/second. Higher limits require approval. Cloudflare recommends shared browsers or tabs and isolated browser contexts.
-
-Browser time costs $0.09/browser-hour after 10 included hours. Browser Sessions also cost $2/month for each average concurrent browser above 10. Keeping all 200 default browsers warm for 720 hours costs about $12,959 in browser time and $380 in concurrency, plus the $780 Workers request floor. Each browser must sustain five renders/second with no headroom. This is a capacity edge, not a safe design.
-
-Use Browser Run as a compatibility fallback or cache-miss path. Do not use Quick Actions for all PNG traffic.
-
-Sources:
-
-- [Browser Run pricing](https://developers.cloudflare.com/browser-run/pricing/) — accessed 2026-09-03.
-- [Browser Run limits](https://developers.cloudflare.com/browser-rendering/limits/) — accessed 2026-09-03.
-
-### Fly Machines and Tigris
-
-Use Fly **performance** CPUs. Shared CPUs have only a 6.25% baseline. Burst credits do not make them sustained render cores.
-
-The model uses Ashburn `performance-8x` Machines with 8 vCPU and 16 GB:
-
-- 11 Machines for the 50-ms SVG case: $2,728/month.
-- 21 Machines for the 100-ms PNG case: $5,208/month.
-
-Fly has no request fee. North America and Europe egress is $0.02/GB. A shared IPv4 and Anycast IPv6 are included. Compute reservation blocks provide a 40% discount for an annual upfront purchase tied to one CPU class and region.
-
-Fly Proxy can start only pre-created Machines. Creating or metric-scaling Machines is slower. The separate metrics autoscaler reconciles every 15 seconds by default. Keep the base fleet warm for sustained load. Pre-create, start, and warm extra Machines before a known burst.
-
-Tigris standard storage is $0.02/GiB-month, writes are $0.005/1,000, reads are $0.0005/1,000, and egress is free. Fly still charges transfer from Machines to Tigris. Tigris publishes no numeric RPS quota and asks customers with extraordinary bandwidth needs to contact support.
-
-Sources:
-
-- [Fly resource pricing](https://fly.io/docs/about/pricing/) — accessed 2026-09-03.
-- [Fly CPU performance](https://fly.io/docs/machines/cpu-performance/) — accessed 2026-09-03.
-- [Fly scale count](https://fly.io/docs/launch/scale-count/) — accessed 2026-09-03.
-- [Fly metrics autoscaling](https://fly.io/docs/launch/autoscale-by-metric/) — accessed 2026-09-03.
-- [Tigris pricing](https://www.tigrisdata.com/pricing/) — accessed 2026-09-03.
-
-### AWS ECS on Fargate
-
-Use an ECS service on Fargate behind an Application Load Balancer. This supports normal long-lived containers and a warm renderer pool.
-
-The lower-bound model uses Linux/ARM in `us-east-1`:
-
-- $0.0000089944/vCPU-second.
-- $0.0000009889/GB-second.
-- 20 GB ephemeral storage included.
-
-Validate the renderer image, Chromium, native rasterizer, and fonts on ARM. Linux/x86 increases modeled compute by about 25%, to $2,986 for SVG and $5,972 for PNG under the same provisioned capacity.
-
-The ALB costs $0.0225/hour plus $0.008/LCU-hour. One LCU includes 1 GB/hour of processed request and response data for container targets. The model includes 24 KiB/request for SVG and 104 KiB/request for PNG. Byte LCUs dominate.
-
-US internet egress includes 100 GB/month, then costs $0.09/GB through 10 TB, $0.085/GB for the next 40 TB, $0.07/GB for the next 100 TB, and $0.05/GB above 150 TB through 500 TB.
-
-The default Fargate On-Demand regional quota is only 6 vCPU and must be raised. Major regions permit a 100-task launch burst and 20 task launches/second by default. The ECS service scheduler can launch 500 Fargate tasks/minute in major regions. Real launch speed also depends on image pulls, health checks, and ALB registration. Pre-run tasks for sharp bursts.
-
-Sources:
-
-- [AWS Fargate pricing](https://aws.amazon.com/fargate/pricing/) — last modified 2026-08-20; accessed 2026-09-03.
-- [Elastic Load Balancing pricing](https://aws.amazon.com/elasticloadbalancing/pricing/) — last modified 2026-08-20; accessed 2026-09-03.
-- [Amazon ECS quotas](https://docs.aws.amazon.com/general/latest/gr/ecs-service.html) — last modified 2026-09-02; accessed 2026-09-03.
-- [Amazon EC2 internet data transfer](https://aws.amazon.com/ec2/pricing/on-demand/#Data_Transfer) — last modified 2026-08-20; accessed 2026-09-03.
-
-## A 1,000-RPS burst is different
-
-A one-minute burst is 60,000 requests. A one-hour burst is 3.6 million. Under the same CPU assumptions, the fleet still needs the full **84 SVG vCPU** or **168 PNG vCPU** while the burst is active. The raw work and output are:
-
-| Duration | SVG CPU work | PNG CPU work | SVG output | PNG output |
-|---|---:|---:|---:|---:|
-| 60 seconds | 3,000 vCPU-s | 6,000 vCPU-s | 1.23 GB | 6.14 GB |
-| 1 hour | 180,000 vCPU-s | 360,000 vCPU-s | 73.73 GB | 368.64 GB |
-
-Once the fleet is warm, one-hour marginal list costs are small relative to a sustained month:
-
-| Deployment | SVG, one hour | PNG, one hour |
-|---|---:|---:|
-| Cloudflare Workers, browser-free | $4.68 | $8.28 |
-| Fly performance Machines | $5.26 | $14.61 |
-| Cloudflare Containers | $9.56 | $23.03 |
-| AWS ARM Fargate + ALB | $10.23 | $40.62 |
-| Cloud Run | $14.89 | $54.50 |
-
-These figures ignore monthly free tiers, included egress, startup rounding, and idle prewarming. An isolated burst can therefore bill less. The problem is capacity readiness:
-
-| Deployment | Burst constraint |
-|---|---|
-| Workers | No general RPS cap, but the renderer must fit the isolate. |
-| Browser Run | Quick Actions stop at 30 RPS. Sessions must be pre-warmed; only three new browsers start each second. |
-| Containers | Fixed/manual pool. Cold containers are not a 1,000-RPS shock absorber. |
-| Fly | Autostart only starts pre-created Machines. Metrics scaling checks every 15 seconds. |
-| Fargate | Raise the 6-vCPU quota, then pre-run tasks. Control-plane launch rates do not guarantee warm readiness. |
-| Cloud Run | Raise regional quotas. Keep enough minimum instances for the immediate step; cold requests can queue or fail. |
-
-A public unauthenticated service also needs an explicit cost ceiling. Set maximum instances, bounded queues, input and output limits, short render deadlines, and overload responses. Rate limiting is still compatible with “no auth.” Without these controls, any provider can convert hostile traffic directly into a large bill.
-
-## Caching break-even
-
-Use an immutable cache key over every output-affecting input:
+For R2 Standard:
 
 ```text
-hash(
-  Mermaid source,
-  Mermaid version,
-  render implementation version,
-  format,
-  security config,
-  theme,
-  fonts,
-  viewport,
-  scale
-)
+class_a = max(0, monthly_writes - 1,000,000) / 1,000,000 * $4.50
+class_b = max(0, monthly_reads - 10,000,000) / 1,000,000 * $0.36
+storage = max(0, average_stored_GB - 10) * $0.015
 ```
 
-Use single-flight fill suppression per key. Otherwise one popular cold key can trigger many duplicate renders and writes.
+## Exclusions and risks
 
-### Prefer free edge cache first
+This estimate does not include:
 
-Workers Cache has no separate storage or operation price. For a canonical `GET`, any cache hit avoids render CPU. It also collapses simultaneous misses. For MCP `POST`, hash the canonical body in a small gateway and fetch a synthetic immutable `GET` internally.
+- Cloudflare WAF, advanced rate limiting, or Bot Management.
+- Log storage, metrics retention, and alerting.
+- Support, taxes, domain registration, or engineering labor.
+- Multi-region spare capacity beyond N+1.
+- Traffic above 1,000 requests/second.
+- Large hostile responses near the configured output limit.
+- Fly capacity adjustments or negotiated enterprise pricing.
 
-This is cheaper than object storage for hot, disposable results. Its trade-off is that it is a cache, not durable storage with a retention guarantee.
+The largest uncontrolled charge is response bandwidth. A public attacker can repeatedly request a cached large image without consuming the miss budget. Enforce a total request and byte limit at the edge before public launch.
 
-### Object-store operation floors
+## Sources
 
-At 2.592 billion requests/month, one lookup per request costs:
+Primary pricing sources, accessed 2026-09-03:
 
-| Store | Reads/month | All-unique writes/month | Egress |
-|---|---:|---:|---:|
-| R2 Standard | about $930 | about $11,660 | Free |
-| Tigris Standard | about $1,296 | about $12,960 | Free |
+- [Fly.io resource pricing](https://fly.io/docs/about/pricing/)
+- [Cloudflare Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/)
+- [Cloudflare Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/)
+- [Cloudflare R2 pricing](https://developers.cloudflare.com/r2/pricing/)
 
-All-unique traffic makes object storage worse even with a one-day lifecycle. Request operations, not stored bytes, dominate.
-
-For a concrete storage case, assume 10% misses, raw 15 KiB SVG or 75 KiB PNG artifacts, uniform writes, and a seven-day lifecycle:
-
-| Store | Read operations | Write operations | SVG storage | PNG storage |
-|---|---:|---:|---:|---:|
-| R2 Standard | about $930 | about $1,162 | about $14 | about $70 |
-| Tigris Standard | about $1,296 | about $1,296 | about $17 | about $87 |
-
-This table excludes render compute and response egress. Storage is cheap. Billions of lookups and hundreds of millions of writes are not.
-
-R2's `r2.dev` endpoint is not a production endpoint and throttles at hundreds of requests/second. Use a custom domain or the Workers API. Tigris publishes no numeric throughput quota; clear sustained 1,000-RPS use with support.
-
-Sources:
-
-- [R2 pricing](https://developers.cloudflare.com/r2/pricing/) — updated 2026-08-07; accessed 2026-09-03.
-- [R2 limits](https://developers.cloudflare.com/r2/platform/limits/) — updated 2026-06-08; accessed 2026-09-03.
-- [Tigris pricing](https://www.tigrisdata.com/pricing/) — accessed 2026-09-03.
-
-### Break-even formula
-
-For one content-addressed object requested `k` times during a seven-day TTL:
-
-```text
-uncached cost = k × C
-cached cost = C + A + S + k × B
-cache wins when k > (C + A + S) / (C - B)
-```
-
-Where:
-
-- `C` is the cost avoided on a cache hit.
-- `A` is one write operation.
-- `B` is one read operation.
-- `S` is seven days of storage for one raw artifact.
-
-This assumes every request checks the object store and every miss writes once. CDN or Workers Cache hits lower object-store operations and improve the result.
-
-| Path | Avoided cost on a hit | SVG break-even | PNG break-even |
-|---|---|---:|---:|
-| Cloudflare Container -> R2 -> Worker/MCP response | Container compute and container egress | **73% hits**, about **4 requests/object** | **48% hits**, about **2 requests/object** |
-| Fly -> Tigris -> embedded MCP response | Fly compute only; Fly still sends MCP bytes | **91% hits**, about **12 requests/object** | **79% hits**, about **5 requests/object** |
-| Fly -> Tigris -> direct raw asset URL | Fly compute and user egress | **85% hits**, about **7 requests/object** | **62% hits**, about **3 requests/object** |
-
-The direct Tigris row changes the response contract. It applies only if the client can fetch or follow a content-addressed URL. Normal MCP image content embeds base64 bytes, so proxying a Tigris hit through Fly retains Fly egress.
-
-## Final recommendation
-
-For unknown or low cache locality, deploy the optimized renderer on **Fly performance Machines in Ashburn**:
-
-- 11 `performance-8x` Machines for the 50-ms SVG model.
-- 21 `performance-8x` Machines for the 100-ms PNG model.
-- Split SVG and PNG pools.
-- Keep the sustained fleet warm.
-- Use no object store at first.
-- Buy the 40% compute reservation only after measurements stabilize.
-
-This is the cheapest credible baseline because it combines the lowest uncached total with normal Linux containers, no request fee, cheap North American egress, and predictable full CPU. It still needs capacity approval and load tests.
-
-If a browser-free Mermaid plus rasterizer prototype fits Cloudflare Workers' 128 MB limit, **Workers become the cheapest implementation**. Use Workers Cache first. Add R2 only for durable asset URLs or after reuse exceeds roughly four SVG requests or two PNG requests per object under this model.
+Capacity measurements come from the committed production image and [architecture report](architecture.md#measured-local-validation).

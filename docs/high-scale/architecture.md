@@ -110,7 +110,9 @@ A local Docker Desktop run used the pinned Node 22.22.3, Mermaid 11.17.2, Puppet
 
 The worker Node and root Chromium PIDs remained stable across the diagram suite and cache-hit load test. No `*.mmd` source or `mermaid-worker-render-*` directory remained under `/tmp`.
 
-These are local functional measurements, not Fly capacity claims. The observed miss latency is materially above the cost report's planning assumptions. A production benchmark must replace those assumptions before fleet purchase.
+A separate cost-sizing run used four CPUs, 8 GiB, four workers, and concurrency four. One hundred unique SVG renders sustained 6.90 fills/second with 707 ms p95. One hundred unique PNG renders sustained 6.86 fills/second with 786 ms p95. The container reached 407% CPU.
+
+These are local functional measurements, not Fly capacity claims. The cost report uses the lower four-CPU result at a 60% target. Run the same benchmark on Fly before fleet purchase.
 
 ## Acceptance evidence
 
