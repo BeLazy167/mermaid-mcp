@@ -2,7 +2,7 @@ services:
   mermaid-mcp:
     build: .
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       RENDER_WORKERS: "2"
       RENDER_QUEUE_SIZE: "4"
