@@ -3,6 +3,9 @@ package server
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,25 +13,43 @@ import (
 	"log/slog"
 	"math"
 	"mime"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/belazy/mermaid-mcp/internal/assetstore"
 	"github.com/belazy/mermaid-mcp/internal/render"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // Options configures the HTTP and MCP handlers.
 type Options struct {
-	Version         string
-	MaxDiagramBytes int64
-	MaxInFlight     int
-	Logger          *slog.Logger
+	Version          string
+	RendererBundleID string
+	MaxDiagramBytes  int64
+	MaxInFlight      int
+	ClientIPHeader   string
+	Ready            func() bool
+	CacheStats       func() render.CacheStats
+	AssetStore       AssetStore
+	AssetHMACKey     []byte
+	Clock            func() time.Time
+	Logger           *slog.Logger
+}
+
+// AssetStore publishes immutable, content-addressed render outputs.
+type AssetStore interface {
+	Lookup(context.Context, string) (assetstore.Metadata, bool, error)
+	Publish(context.Context, string, string, []byte) (assetstore.Metadata, error)
 }
 
 type renderInput struct {
-	Diagram string `json:"diagram" jsonschema:"Mermaid diagram source"`
-	Format  string `json:"format,omitempty" jsonschema:"Output format: png or svg. Defaults to png."`
+	Diagram  string `json:"diagram" jsonschema:"Mermaid diagram source"`
+	Format   string `json:"format,omitempty" jsonschema:"Output format: png or svg. Defaults to png."`
+	Delivery string `json:"delivery,omitempty" jsonschema:"Delivery mode: inline or url. Defaults to inline."`
 }
 
 type errorResponse struct {
@@ -57,6 +78,15 @@ func New(renderer render.Renderer, options Options) (http.Handler, error) {
 	if options.Version == "" {
 		options.Version = "dev"
 	}
+	if options.RendererBundleID == "" {
+		options.RendererBundleID = "dev"
+	}
+	if options.AssetStore != nil && len(options.AssetHMACKey) < 32 {
+		return nil, errors.New("AssetHMACKey must contain at least 32 bytes when AssetStore is configured")
+	}
+	if options.Clock == nil {
+		options.Clock = time.Now
+	}
 
 	mcpServer := newMCPServer(renderer, options)
 	mcpHandler := mcp.NewStreamableHTTPHandler(
@@ -77,22 +107,46 @@ func New(renderer render.Renderer, options Options) (http.Handler, error) {
 		handleRender(writer, request, renderer, options)
 	})))
 	mux.HandleFunc("/healthz", handleHealth)
+	mux.HandleFunc("/readyz", func(writer http.ResponseWriter, request *http.Request) {
+		handleReadiness(writer, request, options.Ready)
+	})
+	mux.HandleFunc("/metrics", func(writer http.ResponseWriter, request *http.Request) {
+		handleMetrics(writer, request, options)
+	})
 
 	originProtection := http.NewCrossOriginProtection()
-	return securityHeaders(originProtection.Handler(mux)), nil
+	return securityHeaders(originProtection.Handler(withClientIdentity(mux, options.ClientIPHeader))), nil
+}
+
+func withClientIdentity(next http.Handler, trustedHeader string) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		identity := ""
+		if trustedHeader != "" {
+			identity = strings.TrimSpace(request.Header.Get(trustedHeader))
+		}
+		if identity == "" {
+			identity = request.RemoteAddr
+			if host, _, err := net.SplitHostPort(request.RemoteAddr); err == nil {
+				identity = host
+			}
+		}
+		ctx := render.WithClientIdentity(request.Context(), identity)
+		next.ServeHTTP(writer, request.WithContext(ctx))
+	})
 }
 
 func newMCPServer(renderer render.Renderer, options Options) *mcp.Server {
 	server := mcp.NewServer(
 		&mcp.Implementation{Name: "mermaid-renderer", Version: options.Version},
 		&mcp.ServerOptions{
-			Instructions: "Render Mermaid source as a PNG or SVG image. No diagrams are stored.",
+			Instructions: "Render Mermaid source as PNG or SVG. Source is never stored; URL delivery may store immutable image output.",
 			Logger:       options.Logger,
+			Capabilities: &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{}},
 		},
 	)
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "render_mermaid",
-		Description: "Render Mermaid diagram source and return the generated image without storing it.",
+		Description: "Render Mermaid source. Return inline image bytes or an optional immutable asset URL.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input renderInput) (*mcp.CallToolResult, any, error) {
 		format, err := render.ParseFormat(input.Format)
 		if err != nil {
@@ -102,6 +156,36 @@ func newMCPServer(renderer render.Renderer, options Options) *mcp.Server {
 		if err := render.ValidateRequest(request, options.MaxDiagramBytes); err != nil {
 			return toolError(err), nil, nil
 		}
+		delivery := strings.ToLower(strings.TrimSpace(input.Delivery))
+		if delivery == "" {
+			delivery = "inline"
+		}
+		if delivery != "inline" && delivery != "url" {
+			return toolError(&render.Error{Code: render.CodeInvalidInput, Message: "delivery must be inline or url"}), nil, nil
+		}
+		if delivery == "url" && options.AssetStore == nil {
+			return toolError(&render.Error{Code: render.CodeInvalidInput, Message: "URL delivery is not configured"}), nil, nil
+		}
+		releaseRequestAdmission(ctx)
+
+		var objectKey string
+		var expiresAt time.Time
+		if delivery == "url" {
+			contentKey := render.ContentKey(options.RendererBundleID, request)
+			now := options.Clock().UTC()
+			objectKey = assetObjectKey(options.AssetHMACKey, contentKey, request.Format, now)
+			expiresAt = now.Truncate(24 * time.Hour).Add(24 * time.Hour)
+			metadata, found, lookupErr := options.AssetStore.Lookup(ctx, objectKey)
+			if lookupErr != nil {
+				err := &render.Error{Code: render.CodeInternal, Message: "could not check rendered asset", Cause: lookupErr}
+				logRenderError(options.Logger, err)
+				return toolError(err), nil, nil
+			}
+			if found {
+				return assetToolResult(metadata, request.Format, expiresAt), nil, nil
+			}
+		}
+
 		result, err := renderer.Render(ctx, request)
 		if err != nil {
 			logRenderError(options.Logger, err)
@@ -118,13 +202,54 @@ func newMCPServer(renderer render.Renderer, options Options) *mcp.Server {
 			logRenderError(options.Logger, err)
 			return toolError(err), nil, nil
 		}
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.ImageContent{Data: data, MIMEType: result.MIMEType},
-			},
-		}, nil, nil
+		if delivery == "inline" {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.ImageContent{Data: data, MIMEType: result.MIMEType},
+				},
+			}, nil, nil
+		}
+
+		metadata, err := options.AssetStore.Publish(ctx, objectKey, result.MIMEType, data)
+		if err != nil {
+			renderErr := &render.Error{Code: render.CodeInternal, Message: "could not publish rendered image", Cause: err}
+			logRenderError(options.Logger, renderErr)
+			return toolError(renderErr), nil, nil
+		}
+		return assetToolResult(metadata, request.Format, expiresAt), nil, nil
 	})
 	return server
+}
+
+func assetObjectKey(hmacKey []byte, contentKey string, format render.Format, now time.Time) string {
+	day := now.UTC().Format("2006-01-02")
+	digest := hmac.New(sha256.New, hmacKey)
+	_, _ = io.WriteString(digest, day)
+	_, _ = digest.Write([]byte{0})
+	_, _ = io.WriteString(digest, contentKey)
+	token := base64.RawURLEncoding.EncodeToString(digest.Sum(nil))
+	return "assets/v1/" + day + "/" + token + "." + string(format)
+}
+
+func assetToolResult(metadata assetstore.Metadata, format render.Format, expiresAt time.Time) *mcp.CallToolResult {
+	size := metadata.Size
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.ResourceLink{
+			URI:         metadata.URL,
+			Name:        "diagram." + string(format),
+			Description: "Immutable rendered Mermaid image",
+			MIMEType:    metadata.MIMEType,
+			Size:        &size,
+		}},
+		StructuredContent: map[string]any{
+			"delivery":  "url",
+			"url":       metadata.URL,
+			"mimeType":  metadata.MIMEType,
+			"size":      size,
+			"sha256":    metadata.SHA256,
+			"expiresAt": expiresAt.Format(time.RFC3339),
+		},
+	}
 }
 
 func handleRender(
@@ -144,6 +269,7 @@ func handleRender(
 		writeRenderError(writer, err)
 		return
 	}
+	releaseRequestAdmission(request.Context())
 	result, err := renderer.Render(request.Context(), input)
 	if err != nil {
 		logRenderError(options.Logger, err)
@@ -164,6 +290,10 @@ func handleRender(
 }
 
 func parseRenderInput(writer http.ResponseWriter, request *http.Request, maxDiagramBytes int64) (render.Request, error) {
+	contentEncoding := strings.ToLower(strings.TrimSpace(request.Header.Get("Content-Encoding")))
+	if contentEncoding != "" && contentEncoding != "identity" {
+		return render.Request{}, &render.Error{Code: render.CodeUnsupportedMediaType, Message: "compressed request bodies are not supported"}
+	}
 	mediaType := ""
 	if header := request.Header.Get("Content-Type"); header != "" {
 		parsed, _, err := mime.ParseMediaType(header)
@@ -199,6 +329,10 @@ func parseRenderInput(writer http.ResponseWriter, request *http.Request, maxDiag
 			Code:    render.CodeUnsupportedMediaType,
 			Message: "content type must be application/json or text/plain",
 		}
+	}
+
+	if input.Delivery != "" {
+		return render.Request{}, &render.Error{Code: render.CodeInvalidInput, Message: "delivery is available only through MCP"}
 	}
 
 	formatName := request.URL.Query().Get("format")
@@ -251,6 +385,72 @@ func expandedJSONLimit(diagramLimit int64) int64 {
 	return diagramLimit*6 + overhead
 }
 
+func handleMetrics(writer http.ResponseWriter, request *http.Request, options Options) {
+	if request.Method != http.MethodGet {
+		writer.Header().Set("Allow", http.MethodGet)
+		writeError(writer, http.StatusMethodNotAllowed, "method_not_allowed", "use GET /metrics")
+		return
+	}
+	stats := render.CacheStats{}
+	if options.CacheStats != nil {
+		stats = options.CacheStats()
+	}
+	ready := 1
+	if options.Ready != nil && !options.Ready() {
+		ready = 0
+	}
+	writer.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	writer.WriteHeader(http.StatusOK)
+	_, _ = fmt.Fprintf(writer, `# TYPE mermaid_cache_hits_total counter
+mermaid_cache_hits_total %d
+# TYPE mermaid_cache_misses_total counter
+mermaid_cache_misses_total %d
+# TYPE mermaid_cache_coalesced_total counter
+mermaid_cache_coalesced_total %d
+# TYPE mermaid_render_overloads_total counter
+mermaid_render_overloads_total %d
+# TYPE mermaid_render_capacity_overloads_total counter
+mermaid_render_capacity_overloads_total %d
+# TYPE mermaid_render_rate_overloads_total counter
+mermaid_render_rate_overloads_total %d
+# TYPE mermaid_render_cluster_overloads_total counter
+mermaid_render_cluster_overloads_total %d
+# TYPE mermaid_cache_evictions_total counter
+mermaid_cache_evictions_total %d
+# TYPE mermaid_cache_expirations_total counter
+mermaid_cache_expirations_total %d
+# TYPE mermaid_render_fills_total counter
+mermaid_render_fills_total %d
+# TYPE mermaid_cache_bytes gauge
+mermaid_cache_bytes %d
+# TYPE mermaid_cache_entries gauge
+mermaid_cache_entries %d
+# TYPE mermaid_render_pending_fills gauge
+mermaid_render_pending_fills %d
+# TYPE mermaid_render_active_fills gauge
+mermaid_render_active_fills %d
+# TYPE mermaid_renderer_ready gauge
+mermaid_renderer_ready %d
+`, stats.Hits, stats.Misses, stats.Coalesced, stats.Overloads, stats.CapacityOverloads,
+		stats.RateOverloads, stats.ClusterOverloads, stats.Evictions, stats.Expirations, stats.Fills, stats.Bytes, stats.Entries,
+		stats.PendingFills, stats.ActiveFills, ready)
+}
+
+func handleReadiness(writer http.ResponseWriter, request *http.Request, ready func() bool) {
+	if request.Method != http.MethodGet {
+		writer.Header().Set("Allow", http.MethodGet)
+		writeError(writer, http.StatusMethodNotAllowed, "method_not_allowed", "use GET /readyz")
+		return
+	}
+	if ready != nil && !ready() {
+		writeError(writer, http.StatusServiceUnavailable, "not_ready", "renderer is not ready")
+		return
+	}
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(writer).Encode(map[string]string{"status": "ready"})
+}
+
 func handleHealth(writer http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodGet {
 		writer.Header().Set("Allow", http.MethodGet)
@@ -289,6 +489,9 @@ func writeRenderError(writer http.ResponseWriter, err error) {
 		status = http.StatusGatewayTimeout
 	case render.CodeCanceled:
 		status = http.StatusRequestTimeout
+	case render.CodeOverloaded:
+		status = http.StatusTooManyRequests
+		writer.Header().Set("Retry-After", "1")
 	case render.CodeInternal:
 		status = http.StatusInternalServerError
 	}
@@ -303,9 +506,15 @@ func writeError(writer http.ResponseWriter, status int, code, message string) {
 
 func logRenderError(logger *slog.Logger, err error) {
 	var renderErr *render.Error
-	if errors.As(err, &renderErr) && renderErr.Code == render.CodeRenderRejected {
-		logger.Info("diagram rejected", "code", renderErr.Code)
-		return
+	if errors.As(err, &renderErr) {
+		switch renderErr.Code {
+		case render.CodeInvalidInput, render.CodeRenderRejected, render.CodeCanceled, render.CodeOverloaded:
+			logger.Debug("render request rejected", "code", renderErr.Code)
+			return
+		case render.CodeTimeout:
+			logger.Warn("render timed out", "code", renderErr.Code)
+			return
+		}
 	}
 	logger.Error("render failed", "error", err)
 }
@@ -313,6 +522,13 @@ func logRenderError(logger *slog.Logger, err error) {
 type requestLimiter struct {
 	slots chan struct{}
 }
+
+type requestAdmission struct {
+	once    sync.Once
+	release func()
+}
+
+type requestAdmissionKey struct{}
 
 func newRequestLimiter(max int) *requestLimiter {
 	return &requestLimiter{slots: make(chan struct{}, max)}
@@ -322,8 +538,10 @@ func (l *requestLimiter) limit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		select {
 		case l.slots <- struct{}{}:
-			defer func() { <-l.slots }()
-			next.ServeHTTP(writer, request)
+			admission := &requestAdmission{release: func() { <-l.slots }}
+			defer admission.once.Do(admission.release)
+			ctx := context.WithValue(request.Context(), requestAdmissionKey{}, admission)
+			next.ServeHTTP(writer, request.WithContext(ctx))
 		default:
 			writer.Header().Set("Retry-After", "1")
 			writeError(writer, http.StatusServiceUnavailable, "overloaded", "server is busy; retry later")
@@ -331,8 +549,15 @@ func (l *requestLimiter) limit(next http.Handler) http.Handler {
 	})
 }
 
+func releaseRequestAdmission(ctx context.Context) {
+	if admission, ok := ctx.Value(requestAdmissionKey{}).(*requestAdmission); ok {
+		admission.once.Do(admission.release)
+	}
+}
+
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Cache-Control", "no-store")
 		writer.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox")
 		writer.Header().Set("Referrer-Policy", "no-referrer")
 		writer.Header().Set("X-Content-Type-Options", "nosniff")
