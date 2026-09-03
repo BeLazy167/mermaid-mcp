@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -10,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/belazy/mermaid-mcp/internal/admission"
+	"github.com/belazy/mermaid-mcp/internal/assetstore"
 	"github.com/belazy/mermaid-mcp/internal/config"
 	"github.com/belazy/mermaid-mcp/internal/render"
 	"github.com/belazy/mermaid-mcp/internal/server"
@@ -26,28 +29,95 @@ func main() {
 }
 
 func run(logger *slog.Logger) error {
+	if err := protectProcessSecrets(); err != nil {
+		return fmt.Errorf("protect process credentials: %w", err)
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
-	renderer, err := render.NewMMDC(render.MMDCConfig{
-		Path:                cfg.MMDCPath,
-		PuppeteerConfigPath: cfg.PuppeteerConfigPath,
-		MermaidConfigPath:   cfg.MermaidConfigPath,
-		MaxDiagramBytes:     cfg.MaxDiagramBytes,
-		MaxOutputBytes:      cfg.MaxOutputBytes,
-		Concurrency:         cfg.RenderConcurrency,
-		Timeout:             cfg.RenderTimeout,
+	var missAdmitter render.MissAdmitter
+	if cfg.ClusterAdmissionURL != "" {
+		missAdmitter, err = admission.NewClient(cfg.ClusterAdmissionURL, cfg.ClusterAdmissionToken)
+		if err != nil {
+			return fmt.Errorf("configure cluster admission: %w", err)
+		}
+	}
+
+	workerPool, err := render.NewWorkerPool(context.Background(), render.WorkerPoolConfig{
+		NodePath:              cfg.NodePath,
+		ScriptPath:            cfg.WorkerScriptPath,
+		ChromiumPath:          cfg.ChromiumPath,
+		MaxDiagramBytes:       cfg.MaxDiagramBytes,
+		MaxOutputBytes:        cfg.MaxOutputBytes,
+		Workers:               cfg.RenderWorkers,
+		QueueSize:             cfg.RenderQueueSize,
+		Timeout:               cfg.RenderTimeout,
+		MaxRendersPerWorker:   cfg.WorkerMaxRenders,
+		MaxWorkerAge:          cfg.WorkerMaxAge,
+		MaxWorkerRSSBytes:     cfg.WorkerMaxRSSBytes,
+		IsolateNetwork:        cfg.WorkerNetworkIsolation,
+		IsolationLauncherPath: cfg.WorkerIsolationLauncher,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := workerPool.Close(); closeErr != nil {
+			logger.Error("close renderer pool", "error", closeErr)
+		}
+	}()
+
+	renderer, err := render.NewCache(workerPool, render.CacheConfig{
+		BundleID:              cfg.RendererBundleID,
+		MaxBytes:              cfg.CacheMaxBytes,
+		MaxEntries:            cfg.CacheMaxEntries,
+		MaxOutputBytes:        cfg.MaxOutputBytes,
+		TTL:                   cfg.CacheTTL,
+		RejectionTTL:          cfg.CacheRejectionTTL,
+		FillTimeout:           cfg.RenderTimeout,
+		MaxWaiters:            cfg.MaxInFlight,
+		MaxConcurrentFills:    cfg.RenderWorkers,
+		MaxQueuedFills:        cfg.RenderQueueSize,
+		MissesPerSecond:       cfg.RenderMissRPS,
+		MissBurst:             cfg.RenderMissBurst,
+		ClientMissesPerSecond: cfg.ClientRenderMissRPS,
+		ClientMissBurst:       cfg.ClientRenderMissBurst,
+		MaxClients:            cfg.ClientLimiterEntries,
+		MissAdmitter:          missAdmitter,
 	})
 	if err != nil {
 		return err
 	}
 
+	var assets server.AssetStore
+	if cfg.AssetStorageConfigured() {
+		assets, err = assetstore.NewR2(assetstore.Config{
+			Endpoint:        cfg.R2Endpoint,
+			AccessKeyID:     cfg.R2AccessKeyID,
+			SecretAccessKey: cfg.R2SecretAccessKey,
+			Bucket:          cfg.R2Bucket,
+			PublicBaseURL:   cfg.AssetPublicBaseURL,
+			ExistenceTTL:    cfg.AssetExistenceTTL,
+			MaxMemoEntries:  cfg.AssetMemoEntries,
+			MaxObjectBytes:  cfg.MaxOutputBytes,
+		})
+		if err != nil {
+			return err
+		}
+	}
+
 	handler, err := server.New(renderer, server.Options{
-		Version:         version,
-		MaxDiagramBytes: cfg.MaxDiagramBytes,
-		MaxInFlight:     cfg.MaxInFlight,
-		Logger:          logger,
+		Version:          version,
+		RendererBundleID: cfg.RendererBundleID,
+		MaxDiagramBytes:  cfg.MaxDiagramBytes,
+		MaxInFlight:      cfg.MaxInFlight,
+		ClientIPHeader:   cfg.TrustedClientIPHeader,
+		Ready:            workerPool.Ready,
+		CacheStats:       renderer.Stats,
+		AssetStore:       assets,
+		AssetHMACKey:     cfg.AssetHMACKey,
+		Logger:           logger,
 	})
 	if err != nil {
 		return err
@@ -57,7 +127,7 @@ func run(logger *slog.Logger) error {
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      cfg.RenderTimeout + 5*time.Second,
+		WriteTimeout:      cfg.RenderTimeout + 65*time.Second,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    16 * 1_024,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
@@ -67,7 +137,7 @@ func run(logger *slog.Logger) error {
 	defer stop()
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Info("service listening", "addr", cfg.Addr, "version", version)
+		logger.Info("service listening", "addr", cfg.Addr, "version", version, "render_workers", cfg.RenderWorkers)
 		errCh <- httpServer.ListenAndServe()
 	}()
 

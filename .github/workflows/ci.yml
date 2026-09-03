@@ -19,3 +19,130 @@ jobs:
       - run: test -z "$(gofmt -l .)"
       - run: go vet ./...
       - run: go test -race ./...
+      - run: node --check renderer/worker.mjs
+      - run: node --test deploy/cloudflare-admission/src/index.test.mjs
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build pinned production image
+        run: docker build --build-arg VERSION="${GITHUB_SHA::12}" -t mermaid-mcp:test .
+      - name: Verify pinned runtime and dependency patches
+        run: |
+          docker run --rm --entrypoint node mermaid-mcp:test /app/containment-test.mjs
+          docker run --rm --user node --entrypoint node mermaid-mcp:test /app/context-isolation-test.mjs
+          docker run --rm --user node --entrypoint node mermaid-mcp:test /app/render-contract-test.mjs
+          docker run --rm --user node --entrypoint renderer-launcher mermaid-mcp:test /usr/local/bin/node /app/network-isolation-test.mjs
+          test "$(docker run --rm --entrypoint node mermaid-mcp:test --version)" = "v22.22.3"
+          test "$(docker run --rm --entrypoint node mermaid-mcp:test -p 'require("/app/node_modules/puppeteer/package.json").version')" = "25.9.0"
+          test "$(docker run --rm --entrypoint node mermaid-mcp:test -p 'require("/app/node_modules/mermaid/package.json").version')" = "11.17.2"
+          docker run --rm --entrypoint chromium mermaid-mcp:test --version | grep -F "Chromium 149.0.7827.53"
+          docker run --rm --entrypoint grep mermaid-mcp:test -F 'opts.detached ??= false;' /app/node_modules/@puppeteer/browsers/lib/launch.js
+      - name: Test real REST and MCP rendering
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name mermaid-mcp-test \
+            --read-only \
+            --tmpfs /tmp:size=512m,mode=1777 \
+            --pids-limit 256 \
+            --memory 2g \
+            --cpus 2 \
+            --security-opt no-new-privileges:true \
+            -e RENDER_WORKERS=1 \
+            -e RENDER_QUEUE_SIZE=2 \
+            -e MAX_IN_FLIGHT=32 \
+            -e RENDER_MISS_RPS=100 \
+            -e RENDER_MISS_BURST=100 \
+            -e CLIENT_RENDER_MISS_RPS=100 \
+            -e CLIENT_RENDER_MISS_BURST=100 \
+            -e R2_ENDPOINT=https://account.r2.cloudflarestorage.com \
+            -e R2_ACCESS_KEY_ID=access \
+            -e R2_SECRET_ACCESS_KEY=must-not-reach-workers \
+            -e R2_BUCKET=renders \
+            -e ASSET_PUBLIC_BASE_URL=https://assets.example.com \
+            -e ASSET_HMAC_KEY=a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s= \
+            -p 127.0.0.1:18080:8080 \
+            mermaid-mcp:test
+          trap 'docker logs mermaid-mcp-test || true; docker rm -f mermaid-mcp-test || true' EXIT
+          for _ in $(seq 1 90); do
+            if curl --fail --silent http://127.0.0.1:18080/readyz >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:18080/readyz >/dev/null
+          gateway_pid="$(docker exec mermaid-mcp-test pgrep -f '^/usr/local/bin/mermaid-mcp$' | head -n 1)"
+          worker_pid="$(docker exec mermaid-mcp-test pgrep -f '^/usr/local/bin/node /app/worker.mjs$' | head -n 1)"
+          test -n "$gateway_pid"
+          test -n "$worker_pid"
+          ! docker exec --user node mermaid-mcp-test cat /proc/1/environ 2>/dev/null
+          ! docker exec --user node mermaid-mcp-test cat "/proc/$gateway_pid/environ" 2>/dev/null
+          curl --fail --silent \
+            -H 'Content-Type: text/plain' \
+            --data-binary 'graph TD; A-->B' \
+            http://127.0.0.1:18080/render \
+            --output /tmp/diagram.png
+          python3 -c 'from pathlib import Path; assert Path("/tmp/diagram.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")'
+          curl --fail --silent \
+            -H 'Content-Type: application/json' \
+            --data '{"diagram":"sequenceDiagram\nA->>B: Render","format":"svg"}' \
+            http://127.0.0.1:18080/render \
+            --output /tmp/diagram.svg
+          python3 -c 'from pathlib import Path; assert b"<svg" in Path("/tmp/diagram.svg").read_bytes()[:512]'
+          curl --fail --silent \
+            -H 'Content-Type: text/plain' \
+            --data-binary $'journey\n  title My day\n  section Work\n    Render: 5: Agent' \
+            'http://127.0.0.1:18080/render?format=svg' \
+            --output /tmp/journey.svg
+          python3 -c 'from pathlib import Path; data=Path("/tmp/journey.svg").read_bytes().lower(); assert b"<svg" in data and b"foreignobject" not in data'
+          directive_status="$(curl --silent --output /tmp/directive.json --write-out '%{http_code}' \
+            -H 'Content-Type: text/plain' \
+            --data-binary '%%{init: {"htmlLabels": true}}%% graph TD; A-->B' \
+            'http://127.0.0.1:18080/render?format=svg')"
+          test "$directive_status" = "422"
+          curl --fail --silent \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -H 'MCP-Protocol-Version: 2025-06-18' \
+            --data '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"render_mermaid","arguments":{"diagram":"graph TD; A-->B","format":"png"}}}' \
+            http://127.0.0.1:18080/mcp \
+            --output /tmp/mcp.json
+          python3 -c 'import json; value=json.load(open("/tmp/mcp.json")); assert value["result"]["content"][0]["type"] == "image"'
+          go run ./cmd/loadtest \
+            -target http://127.0.0.1:18080/render \
+            -requests 2000 \
+            -concurrency 16 \
+            -format svg
+          if go run ./cmd/loadtest \
+            -target http://127.0.0.1:18080/render \
+            -requests 20 \
+            -concurrency 16 \
+            -format svg \
+            -unique > /tmp/unique-load.json; then
+            echo "unique load unexpectedly avoided overload" >&2
+            exit 1
+          fi
+          python3 -c 'import json; value=json.load(open("/tmp/unique-load.json")); codes=value["status_codes"]; assert int(codes["429"]) > 0 and int(codes["200"]) > 0 and set(codes) <= {"200", "429"}'
+          old_worker="$(docker exec mermaid-mcp-test pgrep -f '^/usr/local/bin/node /app/worker.mjs$' | head -n 1)"
+          old_browser="$(docker exec mermaid-mcp-test pgrep -P "$old_worker" chromium | head -n 1)"
+          test -n "$old_worker"
+          test -n "$old_browser"
+          docker exec mermaid-mcp-test kill -9 "$old_worker"
+          for _ in $(seq 1 90); do
+            new_worker="$(docker exec mermaid-mcp-test pgrep -f '^/usr/local/bin/node /app/worker.mjs$' 2>/dev/null | head -n 1 || true)"
+            if test -n "$new_worker" && test "$new_worker" != "$old_worker" && ! docker exec mermaid-mcp-test kill -0 "$old_browser" 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          test "$new_worker" != "$old_worker"
+          ! docker exec mermaid-mcp-test kill -0 "$old_browser" 2>/dev/null
+          curl --fail --silent http://127.0.0.1:18080/readyz >/dev/null
+          test -z "$(docker exec mermaid-mcp-test find /tmp -maxdepth 1 -name 'mermaid-worker-render-*' -print)"
+          test -z "$(docker exec mermaid-mcp-test find /tmp -name '*.mmd' -print)"
