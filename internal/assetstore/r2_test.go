@@ -223,6 +223,12 @@ func TestLastCanceledLookupCancelsBackgroundWork(t *testing.T) {
 		t.Fatalf("first Lookup() error = %v", err)
 	}
 	<-canceled
+	select {
+	case store.operationSlots <- struct{}{}:
+		<-store.operationSlots
+	case <-time.After(time.Second):
+		t.Fatal("canceled operation did not release its capacity slot")
+	}
 	_, found, err := store.Lookup(context.Background(), testKey("second", ".png"))
 	if err != nil || found {
 		t.Fatalf("second Lookup() found=%v error=%v", found, err)

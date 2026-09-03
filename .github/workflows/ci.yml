@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -16,7 +17,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: test -z "$(gofmt -l .)"
+      - run: test -z "$(git ls-files -z '*.go' | xargs -0 gofmt -l)"
       - run: go vet ./...
       - run: go test -race ./...
       - run: node --check renderer/worker.mjs
@@ -32,6 +33,11 @@ jobs:
           cache: true
       - name: Build pinned production image
         run: docker build --build-arg VERSION="${GITHUB_SHA::12}" -t mermaid-mcp:test .
+      - name: Enable Chromium user namespace sandbox
+        run: |
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Verify pinned runtime and dependency patches
         run: |
           docker run --rm --entrypoint node mermaid-mcp:test /app/containment-test.mjs
@@ -81,8 +87,14 @@ jobs:
           worker_pid="$(docker exec mermaid-mcp-test pgrep -f '^/usr/local/bin/node /app/worker.mjs$' | head -n 1)"
           test -n "$gateway_pid"
           test -n "$worker_pid"
-          ! docker exec --user node mermaid-mcp-test cat /proc/1/environ 2>/dev/null
-          ! docker exec --user node mermaid-mcp-test cat "/proc/$gateway_pid/environ" 2>/dev/null
+          if docker exec --user node mermaid-mcp-test cat /proc/1/environ 2>/dev/null; then
+            echo "renderer user can read PID 1 environment"
+            exit 1
+          fi
+          if docker exec --user node mermaid-mcp-test cat "/proc/$gateway_pid/environ" 2>/dev/null; then
+            echo "renderer user can read gateway environment"
+            exit 1
+          fi
           curl --fail --silent \
             -H 'Content-Type: text/plain' \
             --data-binary 'graph TD; A-->B' \
@@ -142,7 +154,10 @@ jobs:
             sleep 1
           done
           test "$new_worker" != "$old_worker"
-          ! docker exec mermaid-mcp-test kill -0 "$old_browser" 2>/dev/null
+          if docker exec mermaid-mcp-test kill -0 "$old_browser" 2>/dev/null; then
+            echo "crashed worker descendant remained alive"
+            exit 1
+          fi
           curl --fail --silent http://127.0.0.1:18080/readyz >/dev/null
           test -z "$(docker exec mermaid-mcp-test find /tmp -maxdepth 1 -name 'mermaid-worker-render-*' -print)"
           test -z "$(docker exec mermaid-mcp-test find /tmp -name '*.mmd' -print)"
