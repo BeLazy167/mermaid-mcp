@@ -137,7 +137,7 @@ jobs:
           docker exec mermaid-mcp-test kill -9 "$old_worker"
           for _ in $(seq 1 90); do
             new_worker="$(docker exec mermaid-mcp-test pgrep -f '^/usr/local/bin/node /app/worker.mjs$' 2>/dev/null | head -n 1 || true)"
-            if test -n "$new_worker" && test "$new_worker" != "$old_worker"; then
+            if test -n "$new_worker" && test "$new_worker" != "$old_worker" && curl --fail --silent http://127.0.0.1:18080/readyz >/dev/null; then
               break
             fi
             sleep 1
