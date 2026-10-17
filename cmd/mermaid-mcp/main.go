@@ -47,7 +47,6 @@ func run(logger *slog.Logger) error {
 	workerPool, err := render.NewWorkerPool(context.Background(), render.WorkerPoolConfig{
 		NodePath:              cfg.NodePath,
 		ScriptPath:            cfg.WorkerScriptPath,
-		ChromiumPath:          cfg.ChromiumPath,
 		MaxDiagramBytes:       cfg.MaxDiagramBytes,
 		MaxOutputBytes:        cfg.MaxOutputBytes,
 		Workers:               cfg.RenderWorkers,

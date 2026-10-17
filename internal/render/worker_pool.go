@@ -26,11 +26,10 @@ const (
 	workerRetryMaxDelay   = time.Second
 )
 
-// WorkerPoolConfig configures persistent Node and Chromium renderer workers.
+// WorkerPoolConfig configures persistent Node renderer workers.
 type WorkerPoolConfig struct {
 	NodePath              string
 	ScriptPath            string
-	ChromiumPath          string
 	TempDir               string
 	MaxDiagramBytes       int64
 	MaxOutputBytes        int64
@@ -798,9 +797,6 @@ func (p *WorkerPool) workerEnvironment() []string {
 	}
 	env = append(env, p.config.ExtraEnv...)
 	env = append(env, fmt.Sprintf("MERMAID_MAX_OUTPUT_BYTES=%d", p.config.MaxOutputBytes))
-	if p.config.ChromiumPath != "" {
-		env = append(env, "MERMAID_CHROMIUM_PATH="+p.config.ChromiumPath)
-	}
 	return env
 }
 

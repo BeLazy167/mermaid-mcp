@@ -42,7 +42,6 @@ func TestLoadCloudPortAndOverrides(t *testing.T) {
 	t.Setenv("PORT", "9090")
 	t.Setenv("NODE_PATH", "/node")
 	t.Setenv("RENDER_WORKER_SCRIPT", "/worker.mjs")
-	t.Setenv("CHROMIUM_PATH", "/chromium")
 	t.Setenv("RENDERER_BUNDLE_ID", "bundle-v1")
 	t.Setenv("RENDER_WORKERS", "3")
 	t.Setenv("RENDER_QUEUE_SIZE", "2")
@@ -78,7 +77,7 @@ func TestLoadCloudPortAndOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if got.Addr != ":9090" || got.NodePath != "/node" || got.WorkerScriptPath != "/worker.mjs" || got.ChromiumPath != "/chromium" {
+	if got.Addr != ":9090" || got.NodePath != "/node" || got.WorkerScriptPath != "/worker.mjs" {
 		t.Fatalf("Load() = %#v", got)
 	}
 	if got.RendererBundleID != "bundle-v1" || got.RenderWorkers != 3 || got.RenderQueueSize != 2 || got.MaxInFlight != 12 {
@@ -174,7 +173,7 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 func clearConfigEnvironment(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{
-		"ADDR", "PORT", "NODE_PATH", "RENDER_WORKER_SCRIPT", "CHROMIUM_PATH", "RENDERER_BUNDLE_ID",
+		"ADDR", "PORT", "NODE_PATH", "RENDER_WORKER_SCRIPT", "RENDERER_BUNDLE_ID",
 		"MAX_DIAGRAM_BYTES", "MAX_OUTPUT_BYTES", "RENDER_WORKERS", "RENDER_QUEUE_SIZE", "MAX_IN_FLIGHT",
 		"RENDER_TIMEOUT", "WORKER_MAX_RENDERS", "WORKER_MAX_AGE", "WORKER_MAX_RSS_BYTES", "WORKER_NETWORK_ISOLATION", "WORKER_ISOLATION_LAUNCHER", "CACHE_MAX_BYTES", "CACHE_MAX_ENTRIES", "CACHE_TTL", "CACHE_REJECTION_TTL",
 		"RENDER_MISS_RPS", "RENDER_MISS_BURST", "CLIENT_RENDER_MISS_RPS", "CLIENT_RENDER_MISS_BURST", "CLIENT_LIMITER_ENTRIES", "TRUSTED_CLIENT_IP_HEADER", "CLUSTER_ADMISSION_URL", "CLUSTER_ADMISSION_TOKEN", "R2_ENDPOINT", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",

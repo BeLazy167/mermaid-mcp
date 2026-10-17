@@ -21,7 +21,6 @@ type Config struct {
 	Addr                    string
 	NodePath                string
 	WorkerScriptPath        string
-	ChromiumPath            string
 	RendererBundleID        string
 	MaxDiagramBytes         int64
 	MaxOutputBytes          int64
@@ -196,7 +195,6 @@ func Load() (Config, error) {
 		Addr:                    addr,
 		NodePath:                envOrDefault("NODE_PATH", "node"),
 		WorkerScriptPath:        envOrDefault("RENDER_WORKER_SCRIPT", "renderer/worker.mjs"),
-		ChromiumPath:            envOrDefault("CHROMIUM_PATH", ""),
 		RendererBundleID:        rendererBundleID,
 		MaxDiagramBytes:         maxDiagramBytes,
 		MaxOutputBytes:          maxOutputBytes,

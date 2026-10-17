@@ -2,7 +2,7 @@
 
 Mermaid MCP turns Mermaid source into PNG or SVG. You can call it through MCP or `POST /render`.
 
-It uses the official Mermaid 11 renderer inside long-running Chromium workers. Chromium starts once per worker, not once per request. Repeated diagrams come from an in-memory cache without touching a browser.
+It renders with [Pele](https://pele.run) inside long-running Node workers. resvg turns the SVG into a PNG. No browser runs. Repeated diagrams come from an in-memory cache without touching a worker.
 
 Mermaid source is never stored. Optional URL delivery stores only validated image output in Cloudflare R2.
 
@@ -96,7 +96,7 @@ flowchart LR
     Renderer --> Image
 ```
 
-Only a new cache fill uses Chromium. Same-key requests join that fill instead of starting duplicate renders. Unique fills pass bounded client, replica, and optional cluster budgets.
+Only a new cache fill uses a renderer worker. Same-key requests join that fill instead of starting duplicate renders. Unique fills pass bounded client, replica, and optional cluster budgets.
 
 ```mermaid
 flowchart LR
@@ -107,22 +107,26 @@ flowchart LR
     Join -->|yes| Wait[Join existing fill]
     Join -->|no| Budget{Miss budget available?}
     Budget -->|no| Reject[429]
-    Budget -->|yes| Worker[Persistent Chromium worker]
+    Budget -->|yes| Worker[Persistent renderer worker]
     Worker --> Validate[Validate output]
     Validate --> Image
 ```
 
-The cache sits before browser admission. A slow render cannot consume every cheap request slot and block popular cached diagrams.
+The cache sits before renderer admission. A slow render cannot consume every cheap request slot and block popular cached diagrams.
 
-## Why it uses Chromium
+## How it renders
 
-The service promises official Mermaid 11 behavior. Mermaid relies on browser DOM APIs, CSS, fonts, SVG layout, and text measurement. Its official CLI render path uses Puppeteer and Chromium.
+Pele parses Mermaid text and lays out the SVG in plain JavaScript. It needs no DOM, so each render is a pure function call. The worker replaces Pele's CSS variables with its default colors, so the SVG looks the same in every viewer.
 
-A browser-free renderer would be cheaper. The tested Rust renderer is fast, but it implements its own Mermaid parser and layout engine. It accepts some unsupported input without returning an error. A silent missing label or flattened group is worse than an explicit rejection when the API claims Mermaid 11 compatibility.
+For PNG output, resvg runs as WebAssembly inside the worker. It loads only the bundled Noto Sans, Noto Sans Mono, and Noto Sans CJK fonts. resvg cannot draw color emoji, so emoji are blank in PNG output. SVG viewers draw them with their own fonts.
 
-The worker pool removes most browser startup cost. Each worker keeps one Chromium process alive. Each request gets a fresh `BrowserContext` and page, which are closed after rendering. This costs more than page reuse but prevents cookies, cache, and page state from crossing requests.
+Pele targets Mermaid 12.1 syntax with its own layout and visual style. Output is not pixel-identical to official Mermaid. Pele rejects input it cannot parse with an explicit error.
 
-A future fast engine can support a named, tested subset such as `fast-v1`. It must use a closed syntax classifier and differential tests against official Mermaid. It should not replace the compatibility renderer silently. See [the renderer decision](docs/high-scale/rendering.md) for the source-level comparison.
+The service used Chromium and the official Mermaid CLI before. See [the earlier renderer decision](docs/high-scale/rendering.md) for that comparison.
+
+## Supply chain
+
+The renderer has two runtime packages, `pele` and `@resvg/resvg-wasm`. Neither has dependencies or install scripts. The lockfile pins exact versions and integrity hashes. The image build runs `npm ci --ignore-scripts` and then `npm audit signatures`, so a bad registry signature fails the build.
 
 ## Why misses are limited
 
@@ -147,7 +151,7 @@ Read [the measured cost estimate](docs/high-scale/cost.md) before raising miss l
 
 Use inline delivery for the broadest MCP compatibility. It needs no object store, but base64 adds about one third to the image bytes.
 
-Use URL delivery when clients can fetch an asset and output bandwidth matters. The gateway checks R2 before rendering, so another replica's validated output can avoid a browser fill. Asset paths contain a daily HMAC instead of the diagram hash.
+Use URL delivery when clients can fetch an asset and output bandwidth matters. The gateway checks R2 before rendering, so another replica's validated output can avoid a new render. Asset paths contain a daily HMAC instead of the diagram hash.
 
 URL delivery has its own cost. Each new object adds R2 operations. Configure a one-day bucket lifecycle or objects accumulate after their expiry metadata becomes stale.
 
@@ -187,9 +191,9 @@ This service accepts hostile input without authentication. No single check is th
 
 The gateway limits source bytes, output bytes, Mermaid text, edges, time, queues, processes, memory, and PID usage. It rejects caller configuration directives and unsafe SVG content.
 
-Renderer workers receive an environment allowlist without gateway or R2 credentials. The Linux launcher applies a fail-closed seccomp filter to the renderer process tree. Chromium keeps its sandbox. Never add `--no-sandbox`.
+Renderer workers receive an environment allowlist without gateway or R2 credentials. The Linux launcher applies a fail-closed seccomp filter to the renderer process tree. Workers have no network access. Pele runs with links and images turned off, so output never references outside resources.
 
-Each render uses a fresh browser context. Go owns its private output directory and removes it after reading the image. Worker crashes, hangs, age, memory, and render count trigger replacement of the whole process group.
+Renders share no state. Go owns its private output directory and removes it after reading the image. Worker crashes, hangs, age, memory, and render count trigger replacement of the whole process group.
 
 The production container needs a read-only root, bounded tmpfs, `no-new-privileges`, memory limits, and PID limits. Put a CDN or reverse proxy in front of public deployments. Enforce total request and byte limits there because the render-miss budget does not cap cached-response bandwidth.
 
@@ -200,7 +204,7 @@ See [the architecture and safety boundaries](docs/high-scale/architecture.md) fo
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `ADDR` | `:$PORT` or `:8080` | Listen address |
-| `RENDER_WORKERS` | `2` | Persistent Chromium workers |
+| `RENDER_WORKERS` | `2` | Persistent renderer workers |
 | `RENDER_QUEUE_SIZE` | `4` | New fills waiting for a worker |
 | `RENDER_TIMEOUT` | `20s` | Queue and render deadline |
 | `MAX_IN_FLIGHT` | `64` | Cheap HTTP ingress concurrency |
@@ -223,7 +227,7 @@ Worker recycling uses `WORKER_MAX_RENDERS`, `WORKER_MAX_AGE`, and `WORKER_MAX_RS
 
 Deploy [`deploy/cloudflare-admission`](deploy/cloudflare-admission) for a public multi-replica service. It uses one Durable Object to enforce minute and UTC-day fill limits.
 
-Set `CLUSTER_ADMISSION_URL` and a `CLUSTER_ADMISSION_TOKEN` of at least 32 bytes on every replica. Admission failures return `429` without starting Chromium.
+Set `CLUSTER_ADMISSION_URL` and a `CLUSTER_ADMISSION_TOKEN` of at least 32 bytes on every replica. Admission failures return `429` without starting a render.
 
 ### R2 URL delivery
 
@@ -248,10 +252,10 @@ Disable bucket listing. Permit public `GET` and `HEAD` only through the custom d
 
 ## Run without Docker
 
-Docker is the supported secure path. A direct development run needs Go 1.25+, Node 22.12+, Chromium, and the exact packages in `renderer/package-lock.json`.
+Docker is the supported secure path. A direct development run needs Go 1.25+, Node 22.12+, the Noto fonts in `/usr/share/fonts/noto`, and the exact packages in `renderer/package-lock.json`.
 
 ```sh
-cd renderer && npm ci
+cd renderer && npm ci --ignore-scripts
 cd ..
 WORKER_NETWORK_ISOLATION=false go run ./cmd/mermaid-mcp
 ```
