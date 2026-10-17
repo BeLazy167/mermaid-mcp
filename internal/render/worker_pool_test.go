@@ -24,41 +24,20 @@ func TestWorkerScriptSecurityPolicy(t *testing.T) {
 	}
 	text := string(source)
 	for _, required := range []string{
-		`securityLevel: "strict"`,
-		"pipe: true",
-		"maxTextSize: 50_000",
+		"limit: 50_000",
 		"maxEdges: 500",
-		"htmlLabels: false",
-		"iconPacks: Object.freeze([])",
-		"browser.createBrowserContext()",
-		"await context.close()",
-		"--disable-background-networking",
-		"--proxy-server=http://0.0.0.0:9",
-		"--host-resolver-rules=MAP * 0.0.0.0",
+		"links: false",
+		"images: false",
 		"MERMAID_MAX_OUTPUT_BYTES",
 	} {
 		if !strings.Contains(text, required) {
 			t.Errorf("worker script missing %q", required)
 		}
 	}
-	if strings.Contains(text, "--no-sandbox") {
-		t.Fatal("worker script disables Chromium sandbox")
-	}
-}
-
-func TestDockerfileKeepsChromiumInWorkerProcessGroup(t *testing.T) {
-	dockerfile, err := os.ReadFile(filepath.Join("..", "..", "Dockerfile"))
-	if err != nil {
-		t.Fatalf("read Dockerfile: %v", err)
-	}
-	patch, err := os.ReadFile(filepath.Join("..", "..", "renderer", "patch-dependencies.mjs"))
-	if err != nil {
-		t.Fatalf("read dependency patch: %v", err)
-	}
-	if !strings.Contains(string(dockerfile), "node patch-dependencies.mjs") ||
-		!strings.Contains(string(patch), `opts.detached ??= false;`) ||
-		!strings.Contains(string(patch), `unexpected dependency source`) {
-		t.Fatal("image does not build-gate the Puppeteer process-group patch")
+	for _, forbidden := range []string{"node:child_process", "node:net", "node:http", "fetch("} {
+		if strings.Contains(text, forbidden) {
+			t.Errorf("worker script uses %q", forbidden)
+		}
 	}
 }
 

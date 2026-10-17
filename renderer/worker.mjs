@@ -1,32 +1,35 @@
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import readline from "node:readline";
 
-import { renderMermaid } from "@mermaid-js/mermaid-cli";
-import puppeteer from "puppeteer";
+import { initWasm, Resvg } from "@resvg/resvg-wasm";
+import { render as renderSVG } from "pele";
 
 const PROTOCOL_VERSION = 1;
 const MAX_OUTPUT_BYTES = Number.parseInt(process.env.MERMAID_MAX_OUTPUT_BYTES ?? "", 10);
 const MAX_OUTPUT_DIMENSION = 8192;
 const MAX_OUTPUT_PIXELS = 16_777_216;
+const BACKGROUND_COLOR = "#ffffff";
+const WASM_PATH = new URL("./node_modules/@resvg/resvg-wasm/index_bg.wasm", import.meta.url);
+const FONT_DIR = "/usr/share/fonts/noto";
+const FONT_FILES = Object.freeze([
+  "NotoSans-Regular.ttf",
+  "NotoSans-Bold.ttf",
+  "NotoSans-Italic.ttf",
+  "NotoSans-BoldItalic.ttf",
+  "NotoSansMono-Regular.ttf",
+  "NotoSansMono-Bold.ttf",
+  "NotoSansCJK-Regular.ttc",
+]);
 const FIXED_RENDER_OPTIONS = Object.freeze({
-  viewport: Object.freeze({ width: 1920, height: 1080, deviceScaleFactor: 1 }),
-  backgroundColor: "white",
-  mermaidConfig: Object.freeze({
-    securityLevel: "strict",
-    maxTextSize: 50_000,
-    maxEdges: 500,
-    htmlLabels: false,
-    flowchart: Object.freeze({ htmlLabels: false }),
-  }),
-  iconPacks: Object.freeze([]),
-  iconPacksNamesAndUrls: Object.freeze([]),
+  limit: 50_000,
+  maxEdges: 500,
+  links: false,
+  images: false,
 });
 
-let browser;
-let closing = false;
-let browserDisconnected = false;
+let fontBuffers;
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -39,29 +42,8 @@ function errorMessage(error) {
   return String(error);
 }
 
-async function closeBrowser() {
-  if (closing) {
-    return;
-  }
-  closing = true;
-  try {
-    await browser?.close();
-  } catch (error) {
-    process.stderr.write(`close Chromium: ${errorMessage(error)}\n`);
-  }
-}
-
-async function terminateFromSignal() {
-  await closeBrowser();
-  process.exit(0);
-}
-
-process.once("SIGTERM", () => {
-  void terminateFromSignal();
-});
-process.once("SIGINT", () => {
-  void terminateFromSignal();
-});
+process.once("SIGTERM", () => process.exit(0));
+process.once("SIGINT", () => process.exit(0));
 
 function validRequest(request) {
   return (
@@ -77,62 +59,88 @@ function validRequest(request) {
   );
 }
 
-function isInfrastructureError(error) {
-  const name = error instanceof Error ? error.constructor.name : "";
-  const message = errorMessage(error).toLowerCase();
+function dimensionsExceeded(width, height) {
   return (
-    browserDisconnected ||
-    !browser.connected ||
-    ["ProtocolError", "TargetCloseError", "TimeoutError"].includes(name) ||
-    ["EACCES", "EIO", "EMFILE", "ENFILE", "ENOSPC"].includes(error?.code) ||
-    message.includes("protocol error") ||
-    message.includes("session closed") ||
-    message.includes("target closed") ||
-    message.includes("connection closed")
+    !Number.isFinite(width) ||
+    !Number.isFinite(height) ||
+    width <= 0 ||
+    height <= 0 ||
+    width > MAX_OUTPUT_DIMENSION ||
+    height > MAX_OUTPUT_DIMENSION ||
+    width * height > MAX_OUTPUT_PIXELS
   );
 }
 
-function outputDimensions(data, format) {
-  if (format === "png") {
-    const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
-    if (buffer.length < 24) {
-      return undefined;
+/**
+ * Replaces every CSS `var()` inside SVG tags with its resolved value.
+ *
+ * Pele themes its output with CSS custom properties. resvg and many image
+ * viewers ignore them, so the worker bakes in Pele's default theme. Text
+ * content is left alone because only markup between `<` and `>` is rewritten.
+ *
+ * Args:
+ *   svg: The SVG markup returned by Pele.
+ *
+ * Returns:
+ *   The SVG with static colors and fonts and a white page background.
+ */
+function resolveVariables(svg) {
+  const tags = /<[^>]*>/g;
+  const definitions = new Map();
+  for (const [tag] of svg.matchAll(tags)) {
+    for (const [, name, value] of tag.matchAll(/(--[\w-]+)\s*:\s*([^;"]+)/g)) {
+      definitions.set(name, value.trim());
     }
-    return [buffer.readUInt32BE(16), buffer.readUInt32BE(20)];
   }
-  const root = String(data).match(/<svg\b[^>]*>/i)?.[0];
-  if (root === undefined) {
-    return undefined;
-  }
-  const viewBox = root.match(/\bviewBox\s*=\s*["']([^"']+)["']/i)?.[1];
-  if (viewBox !== undefined) {
-    const values = viewBox.trim().split(/[\s,]+/).map(Number);
-    if (values.length === 4) {
-      return [values[2], values[3]];
+  const resolve = (text) => {
+    let output = "";
+    let index = 0;
+    let start;
+    while ((start = text.indexOf("var(", index)) !== -1) {
+      let depth = 1;
+      let end = start + 4;
+      while (depth > 0 && end < text.length) {
+        if (text[end] === "(") {
+          depth++;
+        } else if (text[end] === ")") {
+          depth--;
+        }
+        end++;
+      }
+      const inner = text.slice(start + 4, end - 1);
+      const comma = inner.indexOf(",");
+      const name = (comma === -1 ? inner : inner.slice(0, comma)).trim();
+      const fallback = comma === -1 ? "" : inner.slice(comma + 1).trim();
+      output += text.slice(index, start) + resolve(definitions.get(name) ?? fallback);
+      index = end;
     }
-  }
-  const width = root.match(/\bwidth\s*=\s*["']([0-9.]+)(?:px)?["']/i)?.[1];
-  const height = root.match(/\bheight\s*=\s*["']([0-9.]+)(?:px)?["']/i)?.[1];
-  return width !== undefined && height !== undefined ? [Number(width), Number(height)] : undefined;
+    return output + text.slice(index);
+  };
+  return svg
+    .replace(tags, resolve)
+    .replace(/^<svg\b([^>]*?)\bstyle="/, `<svg$1style="background-color:${BACKGROUND_COLOR};`);
 }
 
-function outputLimitError(data, format) {
-  if (Buffer.byteLength(data) > MAX_OUTPUT_BYTES) {
-    return `rendered image exceeds the ${MAX_OUTPUT_BYTES}-byte limit`;
+function rasterize(svg) {
+  const resvg = new Resvg(svg, {
+    background: BACKGROUND_COLOR,
+    font: {
+      fontBuffers,
+      defaultFontFamily: "Noto Sans",
+      sansSerifFamily: "Noto Sans",
+      monospaceFamily: "Noto Sans Mono",
+    },
+  });
+  try {
+    const image = resvg.render();
+    try {
+      return image.asPng();
+    } finally {
+      image.free();
+    }
+  } finally {
+    resvg.free();
   }
-  const dimensions = outputDimensions(data, format);
-  if (
-    dimensions !== undefined &&
-    (!dimensions.every(Number.isFinite) ||
-      dimensions[0] <= 0 ||
-      dimensions[1] <= 0 ||
-      dimensions[0] > MAX_OUTPUT_DIMENSION ||
-      dimensions[1] > MAX_OUTPUT_DIMENSION ||
-      dimensions[0] * dimensions[1] > MAX_OUTPUT_PIXELS)
-  ) {
-    return "rendered image dimensions exceed the safety limit";
-  }
-  return undefined;
 }
 
 async function render(request) {
@@ -147,74 +155,57 @@ async function render(request) {
     });
     return false;
   }
-  if (browserDisconnected || !browser.connected) {
-    send({
-      type: "result",
-      id: request.id,
-      ok: false,
-      error: "Chromium disconnected",
-      kind: "internal",
-      fatal: true,
-    });
-    return false;
-  }
 
-  let context;
+  let rendered;
   try {
-    context = await browser.createBrowserContext();
+    rendered = renderSVG(request.diagram, FIXED_RENDER_OPTIONS);
   } catch (error) {
     send({
       type: "result",
       id: request.id,
       ok: false,
-      error: "could not create isolated browser context",
-      kind: "internal",
-      fatal: true,
+      error: errorMessage(error),
+      kind: "render",
+      fatal: false,
     });
-    return false;
+    return true;
   }
 
+  if (dimensionsExceeded(rendered.width, rendered.height)) {
+    send({
+      type: "result",
+      id: request.id,
+      ok: false,
+      error: "rendered image dimensions exceed the safety limit",
+      kind: "too_large",
+      fatal: false,
+    });
+    return true;
+  }
+
+  const svg = resolveVariables(rendered.svg);
   let data;
-  let failure;
-  let fatal = false;
   try {
-    ({ data } = await renderMermaid(
-      context,
-      request.diagram,
-      request.format,
-      FIXED_RENDER_OPTIONS,
-    ));
+    data = request.format === "png" ? rasterize(svg) : svg;
   } catch (error) {
-    failure = error;
-    fatal = isInfrastructureError(error);
-  } finally {
-    try {
-      await context.close();
-    } catch (error) {
-      failure ??= error;
-      fatal = true;
-    }
-  }
-
-  if (failure !== undefined) {
+    process.stderr.write(`rasterize: ${errorMessage(error)}\n`);
     send({
       type: "result",
       id: request.id,
       ok: false,
-      error: fatal ? "renderer infrastructure failed" : errorMessage(failure),
-      kind: fatal ? "internal" : "render",
-      fatal,
+      error: "renderer infrastructure failed",
+      kind: "internal",
+      fatal: true,
     });
-    return !fatal;
+    return false;
   }
 
-  const limitError = outputLimitError(data, request.format);
-  if (limitError !== undefined) {
+  if (Buffer.byteLength(data) > MAX_OUTPUT_BYTES) {
     send({
       type: "result",
       id: request.id,
       ok: false,
-      error: limitError,
+      error: `rendered image exceeds the ${MAX_OUTPUT_BYTES}-byte limit`,
       kind: "too_large",
       fatal: false,
     });
@@ -241,30 +232,8 @@ async function main() {
   if (!Number.isSafeInteger(MAX_OUTPUT_BYTES) || MAX_OUTPUT_BYTES <= 0) {
     throw new Error("MERMAID_MAX_OUTPUT_BYTES must be a positive integer");
   }
-  const launchOptions = {
-    headless: true,
-    pipe: true,
-    args: [
-      "--disable-background-networking",
-      "--disable-dev-shm-usage",
-      "--proxy-server=http://0.0.0.0:9",
-      "--proxy-bypass-list=<-loopback>",
-      "--host-resolver-rules=MAP * 0.0.0.0",
-      "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-    ],
-  };
-  if (process.env.MERMAID_CHROMIUM_PATH) {
-    launchOptions.executablePath = process.env.MERMAID_CHROMIUM_PATH;
-  }
-  browser = await puppeteer.launch(launchOptions);
-  browser.once("disconnected", () => {
-    browserDisconnected = true;
-    if (!closing) {
-      process.stderr.write("Chromium disconnected\n");
-      process.exitCode = 1;
-      process.stdin.destroy();
-    }
-  });
+  await initWasm(await readFile(WASM_PATH));
+  fontBuffers = await Promise.all(FONT_FILES.map((file) => readFile(path.join(FONT_DIR, file))));
   send({ type: "ready", protocol: PROTOCOL_VERSION });
 
   const lines = readline.createInterface({
@@ -284,13 +253,11 @@ async function main() {
       break;
     }
   }
-  await closeBrowser();
 }
 
 try {
   await main();
 } catch (error) {
   process.stderr.write(`renderer worker failed: ${errorMessage(error)}\n`);
-  await closeBrowser();
   process.exitCode = 1;
 }

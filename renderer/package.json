@@ -6,8 +6,7 @@
     "node": ">=22.12"
   },
   "dependencies": {
-    "@mermaid-js/mermaid-cli": "11.17.0",
-    "mermaid": "11.17.2",
-    "puppeteer": "25.9.0"
+    "@resvg/resvg-wasm": "2.6.2",
+    "pele": "1.6.0"
   }
 }
