@@ -1,0 +1,24 @@
+name: CI
+
+# The Forgejo copy of .github/workflows/ci.yml, run by the mini PC runner. Its job containers have no Docker,
+# so the image build and container tests stay in the GitHub workflow until GitHub Actions are turned off.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          # The runner mounts warm Go build and module caches.
+          cache: false
+      - run: test -z "$(git ls-files -z '*.go' | xargs -0 gofmt -l)"
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: node --check renderer/worker.mjs
+      - run: node --test deploy/cloudflare-admission/src/index.test.mjs
