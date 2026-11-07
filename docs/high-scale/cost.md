@@ -58,7 +58,7 @@ Docker Desktop is not Fly hardware. Treat the machine counts as planning numbers
 
 ## Fly compute
 
-The deployed shape in `fly.toml` is `performance-4x` with 8 GB in IAD. Its current list price is **$124/month**. Fly reservation blocks discount eligible compute by 40% when paid annually. The reservation column assumes full use of the credits.
+The planned shape is `performance-4x` with 8 GB in IAD. Its current list price is **$124/month**. Fly reservation blocks discount eligible compute by 40% when paid annually. The reservation column assumes full use of the credits.
 
 | Local hit ratio | New fills/s | Active Machines | Machines with N+1 | On demand | Reserved, amortized |
 | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -69,7 +69,7 @@ The deployed shape in `fly.toml` is `performance-4x` with 8 GB in IAD. Its curre
 | 50% | 500 | 122 | 123 | $15,252 | $9,151 |
 | 0% | 1,000 | 243 | 244 | $30,256 | $18,154 |
 
-The current two-Machine fleet has about 8.2 planned fills/second in normal operation. It has about 4.1 fills/second after one Machine fails. The `RENDER_MISS_RPS=10` value in `fly.toml` is therefore above the measured N+1 planning capacity.
+The current two-Machine fleet has about 8.2 planned fills/second in normal operation. It has about 4.1 fills/second after one Machine fails. The planned `RENDER_MISS_RPS=10` value is therefore above the measured N+1 planning capacity.
 
 A lean launch can test two `performance-2x` Machines with two workers each. Those Machines cost **$62/month each** in IAD. This lowers the fixed compute floor from $248 to $124. Do not make this change before a Fly benchmark confirms capacity and RSS.
 

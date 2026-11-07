@@ -219,7 +219,7 @@ See [the architecture and safety boundaries](docs/high-scale/architecture.md) fo
 | `CLIENT_RENDER_MISS_BURST` | `3` | Client fill burst |
 | `TRUSTED_CLIENT_IP_HEADER` | unset | Sanitized client IP header from a trusted proxy |
 
-`MAX_IN_FLIGHT` must cover `RENDER_WORKERS + RENDER_QUEUE_SIZE`. Set `TRUSTED_CLIENT_IP_HEADER` only when the ingress proxy overwrites the header. The Fly baseline uses `Fly-Client-IP`.
+`MAX_IN_FLIGHT` must cover `RENDER_WORKERS + RENDER_QUEUE_SIZE`. Set `TRUSTED_CLIENT_IP_HEADER` only when the ingress proxy overwrites the header.
 
 Worker recycling uses `WORKER_MAX_RENDERS`, `WORKER_MAX_AGE`, and `WORKER_MAX_RSS_BYTES`. The production image sets an immutable `RENDERER_BUNDLE_ID` from the pinned renderer stack. Change that ID after any renderer, font, or output-policy change.
 
@@ -293,21 +293,6 @@ go run ./cmd/loadtest \
 ```
 
 Add `-unique` to measure admission and unique-fill capacity. Expected `429` responses make that command exit nonzero.
-
-## Deploy on Fly.io
-
-`fly.toml` defines two warm `performance-4x` Machines in `iad`. It disables scale-to-zero and checks renderer readiness.
-
-```sh
-fly apps create YOUR_APP
-fly deploy --app YOUR_APP \
-  --build-arg VERSION="$(git rev-parse --short=12 HEAD)"
-fly scale count 2 --app YOUR_APP
-```
-
-Configure the shared fill budget before a public multi-replica launch. Put an edge proxy in front of Fly. Keep a fixed Machine maximum and billing alerts.
-
-Run the unique-input load test on Fly before buying reservations or raising admission. Local Docker measurements are not Fly capacity guarantees.
 
 ## Read the design record
 
